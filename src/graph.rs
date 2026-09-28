@@ -296,9 +296,7 @@ impl GraphNetwork {
                     kernel,
                     stride,
                 } => {
-                    let Some(input) = node.inputs.first() else {
-                        return 0;
-                    };
+                    let input = node.inputs.first()?;
                     let Some(shape) = shapes.get(input) else {
                         return 0;
                     };
@@ -311,9 +309,7 @@ impl GraphNetwork {
                         * kernel) as u64
                 }
                 GraphOp::SelfAttention { channels, .. } => {
-                    let Some(input) = node.inputs.first() else {
-                        return 0;
-                    };
+                    let input = node.inputs.first()?;
                     let Some(shape) = shapes.get(input) else {
                         return 0;
                     };
@@ -327,9 +323,7 @@ impl GraphNetwork {
                     input_size,
                     hidden_size,
                 } => {
-                    let Some(input) = node.inputs.first() else {
-                        return 0;
-                    };
+                    let input = node.inputs.first()?;
                     let Some(shape) = shapes.get(input) else {
                         return 0;
                     };
@@ -373,12 +367,19 @@ impl GraphNetwork {
                     let x = single_input(&values, node)?;
                     let mut y = vec![0.0; *output];
 
-                    for o in 0..*output {
+                    for (o, y_value) in
+                        y.iter_mut().enumerate().take(*output)
+                    {
                         let mut sum = node.bias[o];
-                        for i in 0..*width {
-                            sum += node.weights[o * *width + i] * x[i];
+
+                        for (i, x_value) in
+                            x.iter().enumerate().take(*width)
+                        {
+                            sum +=
+                                node.weights[o * *width + i] * *x_value;
                         }
-                        y[o] = sum;
+
+                        *y_value = sum;
                     }
 
                     y
@@ -929,7 +930,7 @@ pub fn random_graph<R: Rng>(
             channels: input_shape.channels,
             heads: (1..=4)
                 .rev()
-                .find(|heads| input_shape.channels % heads == 0)
+                .find(|heads| input_shape.channels.is_multiple_of(*heads))
                 .unwrap_or(1),
         }
     };
@@ -1638,7 +1639,7 @@ mod tests {
 
         graph.validate().expect("valid graph");
         assert_eq!(
-            graph.forward(&vec![0.1; 10]).expect("forward").len(),
+            graph.forward(&[0.1; 10]).expect("forward").len(),
             2
         );
     }
@@ -1690,7 +1691,7 @@ mod tests {
 
         graph.validate().expect("valid graph");
         assert_eq!(
-            graph.forward(&vec![0.2; 12]).expect("forward").len(),
+            graph.forward(&[0.2; 12]).expect("forward").len(),
             2
         );
     }
@@ -1742,7 +1743,7 @@ mod tests {
 
         graph.validate().expect("valid graph");
         assert_eq!(
-            graph.forward(&vec![0.3; 12]).expect("forward").len(),
+            graph.forward(&[0.3; 12]).expect("forward").len(),
             2
         );
     }
@@ -1764,7 +1765,7 @@ mod tests {
         };
 
         assert_eq!(residual, 4);
-        assert_eq!(graph.forward(&vec![0.1; 4]).expect("forward").len(), 2);
+        assert_eq!(graph.forward(&[0.1; 4]).expect("forward").len(), 2);
     }
 
     #[test]
