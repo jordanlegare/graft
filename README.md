@@ -8,6 +8,18 @@ metadata, and representative input/target samples.
 
 Graft now has two complementary candidate-generation modes.
 
+### Dataset separation
+
+The search uses a reproducible three-way dataset split:
+
+- training samples are used only for candidate fine-tuning
+- validation samples drive behavior-aware mutation probes and accuracy acceptance
+- holdout samples are evaluated only after the search, and never influence mutation selection or ranking
+
+The split is controlled with `--validation-fraction`, `--holdout-fraction`,
+and `--split-seed`. The default is 70% training, 15% validation, and 15%
+holdout.
+
 ### Weight-guided grafting
 
 Guided candidates start from the supplied trained network instead of random
@@ -72,7 +84,7 @@ seed/
 ## Weight-guided search
 
 ~~~
-cargo run --release --bin neuro-search --   --manifest seed/manifest.json   --dataset seed/dataset.json   --candidates 100   --epochs 25   --learning-rate 0.01   --accuracy-tolerance 0.01   --min-width 4   --max-width 64   --min-depth 1   --max-depth 4   --guided-fraction 0.75   --guided-mutations 3   --similarity-threshold 0.85   --activation-candidates relu,tanh   --export-best-dir grafted   --output results.json
+cargo run --release --bin neuro-search --   --manifest seed/manifest.json   --dataset seed/dataset.json   --candidates 100   --epochs 25   --learning-rate 0.01   --accuracy-tolerance 0.01   --min-width 4   --max-width 64   --min-depth 1   --max-depth 4   --guided-fraction 0.75   --guided-mutations 3   --similarity-threshold 0.85   --activation-candidates relu,tanh   --validation-fraction 0.15   --holdout-fraction 0.15   --split-seed 42   --export-best-dir grafted   --output results.json
 ~~~
 
 The default guided-fraction=0.75 means roughly three quarters of the
@@ -121,6 +133,10 @@ Run with:
 The model uses the number of active connections when estimating MAC and weight
 read energy. It is still an analytical estimate; electrical measurements on
 the target device are required for a physical energy claim.
+
+Search result `mse` is validation MSE. Each result also records
+`holdout_mse`; the holdout value is computed only after candidate generation
+and does not affect candidate selection.
 
 ## Manifest
 
