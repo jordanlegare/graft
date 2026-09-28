@@ -68,6 +68,8 @@ jobs:
           --dataset seed/graph-dataset.json
           --candidates 8
           --mutations 3
+          --epochs 3
+          --learning-rate 0.01
           --accuracy-tolerance 0.05
           --validation-fraction 0.15
           --holdout-fraction 0.15
