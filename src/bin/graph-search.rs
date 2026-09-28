@@ -27,6 +27,12 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     mutations: usize,
 
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+
+    #[arg(long, default_value_t = 0.01)]
+    learning_rate: f32,
+
     #[arg(long, default_value_t = 0.01)]
     accuracy_tolerance: f32,
 
@@ -73,6 +79,11 @@ fn main() -> Result<()> {
 
     anyhow::ensure!(args.candidates > 0, "candidates must be > 0");
     anyhow::ensure!(args.mutations > 0, "mutations must be > 0");
+    anyhow::ensure!(args.epochs > 0, "epochs must be > 0");
+    anyhow::ensure!(
+        args.learning_rate > 0.0 && args.learning_rate.is_finite(),
+        "learning_rate must be finite and > 0"
+    );
 
     let graph: GraphNetwork =
         serde_json::from_str(
@@ -110,11 +121,15 @@ fn main() -> Result<()> {
 
     let results = search_graph(
         &graph,
+        &train.inputs,
+        &train.targets,
         &validation.inputs,
         &validation.targets,
         &GraphSearchConfig {
             candidates: args.candidates,
             mutations: args.mutations,
+            epochs: args.epochs,
+            learning_rate: args.learning_rate,
             accuracy_tolerance: args.accuracy_tolerance,
         },
         &mut rng,
