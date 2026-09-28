@@ -1554,7 +1554,6 @@ fn backward_node(
                     }
                 }
 
-                let _ = previous_state_base;
             }
 
             Ok(vec![(node.inputs[0], gradient_input)])
