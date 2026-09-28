@@ -189,18 +189,18 @@ impl Network {
         for layer in &self.layers {
             let mut y = vec![0.0; layer.output];
 
-            for o in 0..layer.output {
+            for (o, y_value) in y.iter_mut().enumerate().take(layer.output) {
                 let mut sum = layer.bias[o];
 
-                for i in 0..layer.input {
+                for (i, x_value) in x.iter().enumerate().take(layer.input) {
                     let idx = o * layer.input + i;
 
                     if layer.active[idx] {
-                        sum += layer.weights[idx] * x[i];
+                        sum += layer.weights[idx] * *x_value;
                     }
                 }
 
-                y[o] = layer.activation.apply(sum);
+                *y_value = layer.activation.apply(sum);
             }
 
             x = y;
