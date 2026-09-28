@@ -1794,9 +1794,6 @@ fn parameter_gradients(
                         vec![0.0; length];
 
                     for key in 0..length {
-                        let probability =
-                            probabilities[base + key];
-
                         for channel in
                             start_channel..end_channel
                         {
@@ -1809,8 +1806,6 @@ fn parameter_gradients(
                                         + key
                                 ];
                         }
-
-                        let _ = probability;
                     }
 
                     let weighted_probability =
@@ -3144,6 +3139,62 @@ mod tests {
 
         let result = graph.rewire_input(1, 0, 3);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dense_graph_training_reduces_error() {
+        let shape = TensorShape::vector(1).expect("shape");
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let dense = GraphNode {
+            id: 1,
+            inputs: vec![0],
+            op: GraphOp::Dense {
+                input: 1,
+                output: 1,
+            },
+            weights: vec![0.0],
+            bias: vec![0.0],
+        };
+
+        let mut graph = GraphNetwork {
+            nodes: vec![input, dense],
+            output: 1,
+        };
+        graph.validate().expect("valid graph");
+
+        let inputs = vec![
+            vec![-2.0],
+            vec![-1.0],
+            vec![1.0],
+            vec![2.0],
+        ];
+        let targets = inputs
+            .iter()
+            .map(|input| vec![3.0 * input[0] + 1.0])
+            .collect::<Vec<_>>();
+
+        let before =
+            graph_mse(&graph, &inputs, &targets)
+                .expect("before MSE");
+
+        graph
+            .train(&inputs, &targets, 25, 0.05)
+            .expect("graph training");
+
+        let after =
+            graph_mse(&graph, &inputs, &targets)
+                .expect("after MSE");
+
+        assert!(
+            after < before,
+            "training did not reduce MSE: before={before}, after={after}"
+        );
     }
 
     #[test]
