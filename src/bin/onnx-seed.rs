@@ -73,11 +73,11 @@ fn main() -> Result<()> {
     write_f32("seed/b1.bin", &b1)?;
 
     let onnx_w0: Vec<f32> = (0..INPUT)
-        .flat_map(|i| (0..HIDDEN).map(move |h| w0[h * INPUT + i]))
+        .flat_map(|i| (0..HIDDEN).map(|h| w0[h * INPUT + i]))
         .collect();
 
     let onnx_w1: Vec<f32> = (0..HIDDEN)
-        .flat_map(|h| (0..OUTPUT).map(move |o| w1[o * HIDDEN + h]))
+        .flat_map(|h| (0..OUTPUT).map(|o| w1[o * HIDDEN + h]))
         .collect();
 
     let graph = GraphProto {
