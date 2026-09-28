@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Compile
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --all-targets
+
+      - name: Generate ONNX seed
+        run: cargo run --release --bin onnx-seed
+
+      - name: Smoke-test search
+        run: >
+          cargo run --release --bin neuro-search --
+          --manifest seed/manifest.json
+          --dataset seed/dataset.json
+          --candidates 8
+          --epochs 2
+          --min-width 4
+          --max-width 20
+          --min-depth 1
+          --max-depth 3
