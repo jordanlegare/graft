@@ -1214,6 +1214,1036 @@ impl GraphNetwork {
     }
 }
 
+
+#[derive(Debug, Clone)]
+enum TrainingCache {
+    Input,
+    Dense {
+        input: Vec<f32>,
+    },
+    Conv1d {
+        input: Vec<f32>,
+    },
+    SelfAttention {
+        input: Vec<f32>,
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        probabilities: Vec<f32>,
+    },
+    Recurrent {
+        input: Vec<f32>,
+        states: Vec<f32>,
+    },
+    Add,
+    Activation {
+        input: Vec<f32>,
+    },
+}
+
+fn backward_node(
+    node: &GraphNode,
+    cache: &TrainingCache,
+    gradient_output: &[f32],
+) -> anyhow::Result<Vec<(usize, Vec<f32>)>> {
+    match cache {
+        TrainingCache::Input => Ok(Vec::new()),
+        TrainingCache::Dense { input } => {
+            let GraphOp::Dense { input: width, output } = &node.op else {
+                anyhow::bail!("dense cache does not match node {}", node.id);
+            };
+
+            anyhow::ensure!(
+                gradient_output.len() == *output,
+                "dense output gradient mismatch"
+            );
+
+            let mut gradient_input = vec![0.0; *width];
+
+            for (o, gradient_value) in
+                gradient_output.iter().enumerate()
+            {
+                for (i, input_gradient) in
+                    gradient_input.iter_mut().enumerate().take(*width)
+                {
+                    *input_gradient +=
+                        node.weights[o * *width + i]
+                            * *gradient_value;
+                }
+            }
+
+            Ok(vec![(node.inputs[0], gradient_input)])
+        }
+        TrainingCache::Conv1d { input } => {
+            let GraphOp::Conv1d {
+                input_channels,
+                output_channels,
+                kernel,
+                stride,
+            } = &node.op else {
+                anyhow::bail!("conv cache does not match node {}", node.id);
+            };
+
+            let length = input.len() / *input_channels;
+            let output_length =
+                (length - *kernel + *stride).div_ceil(*stride);
+            let mut gradient_input =
+                vec![0.0; input.len()];
+
+            for oc in 0..*output_channels {
+                for pos in 0..output_length {
+                    let gradient_value =
+                        gradient_output[oc * output_length + pos];
+
+                    for ic in 0..*input_channels {
+                        for k in 0..*kernel {
+                            let source =
+                                pos * *stride + k;
+
+                            if source < length {
+                                let weight =
+                                    node.weights[
+                                        (oc * *input_channels + ic)
+                                            * *kernel
+                                            + k
+                                    ];
+
+                                gradient_input[
+                                    ic * length + source
+                                ] += weight * gradient_value;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(vec![(node.inputs[0], gradient_input)])
+        }
+        TrainingCache::SelfAttention {
+            input,
+            q,
+            k,
+            v,
+            probabilities,
+        } => {
+            let GraphOp::SelfAttention {
+                channels,
+                heads,
+            } = &node.op else {
+                anyhow::bail!(
+                    "attention cache does not match node {}",
+                    node.id
+                );
+            };
+
+            let length = input.len() / *channels;
+            let head_dim = *channels / *heads;
+            let mut gradient_q =
+                vec![0.0; q.len()];
+            let mut gradient_k =
+                vec![0.0; k.len()];
+            let mut gradient_v =
+                vec![0.0; v.len()];
+            let mut gradient_context =
+                vec![0.0; input.len()];
+            let output_base =
+                3 * *channels * *channels;
+
+            for seq in 0..length {
+                for row in 0..*channels {
+                    let gradient_value =
+                        gradient_output[
+                            row * length + seq
+                        ];
+
+                    for column in 0..*channels {
+                        gradient_context[
+                            column * length + seq
+                        ] += node.weights[
+                            output_base
+                                + row * *channels
+                                + column
+                        ] * gradient_value;
+                    }
+                }
+            }
+
+            for head in 0..*heads {
+                let start = head * head_dim;
+                let end = start + head_dim;
+
+                for query in 0..length {
+                    let mut gradient_probability =
+                        vec![0.0; length];
+
+                    for key in 0..length {
+                        let mut value = 0.0;
+
+                        for channel in start..end {
+                            value +=
+                                gradient_context[
+                                    channel * length + query
+                                ] * v[
+                                    channel * length + key
+                                ];
+
+                            gradient_v[
+                                channel * length + key
+                            ] += probabilities[
+                                (head * length + query)
+                                    * length
+                                    + key
+                            ] * gradient_context[
+                                channel * length + query
+                            ];
+                        }
+
+                        gradient_probability[key] = value;
+                    }
+
+                    let probability_base =
+                        (head * length + query)
+                            * length;
+                    let mut weighted_probability = 0.0;
+
+                    for key in 0..length {
+                        weighted_probability +=
+                            gradient_probability[key]
+                                * probabilities[
+                                    probability_base + key
+                                ];
+                    }
+
+                    for key in 0..length {
+                        let probability =
+                            probabilities[
+                                probability_base + key
+                            ];
+                        let gradient_score =
+                            probability
+                                * (gradient_probability[key]
+                                    - weighted_probability);
+
+                        for channel in start..end {
+                            let q_value =
+                                q[channel * length + query];
+                            let k_value =
+                                k[channel * length + key];
+                            let scale =
+                                (head_dim as f32).sqrt();
+
+                            gradient_q[
+                                channel * length + query
+                            ] += gradient_score
+                                * k_value
+                                / scale;
+
+                            gradient_k[
+                                channel * length + key
+                            ] += gradient_score
+                                * q_value
+                                / scale;
+                        }
+                    }
+                }
+            }
+
+            let mut gradient_input =
+                vec![0.0; input.len()];
+            let q_base = 0;
+            let k_base =
+                *channels * *channels;
+            let v_base =
+                2 * *channels * *channels;
+
+            for seq in 0..length {
+                for row in 0..*channels {
+                    let q_grad =
+                        gradient_q[row * length + seq];
+                    let k_grad =
+                        gradient_k[row * length + seq];
+                    let v_grad =
+                        gradient_v[row * length + seq];
+
+                    for column in 0..*channels {
+                        gradient_input[
+                            column * length + seq
+                        ] +=
+                            node.weights[
+                                q_base
+                                    + row * *channels
+                                    + column
+                            ] * q_grad
+                            + node.weights[
+                                k_base
+                                    + row * *channels
+                                    + column
+                            ] * k_grad
+                            + node.weights[
+                                v_base
+                                    + row * *channels
+                                    + column
+                            ] * v_grad;
+                    }
+                }
+            }
+
+            Ok(vec![(node.inputs[0], gradient_input)])
+        }
+        TrainingCache::Recurrent {
+            input,
+            states,
+        } => {
+            let GraphOp::Recurrent {
+                input_size,
+                hidden_size,
+            } = &node.op else {
+                anyhow::bail!(
+                    "recurrent cache does not match node {}",
+                    node.id
+                );
+            };
+
+            let length = input.len() / *input_size;
+            let input_weight_count =
+                *input_size * *hidden_size;
+            let mut gradient_input =
+                vec![0.0; input.len()];
+            let mut gradient_state =
+                vec![0.0; *hidden_size];
+
+            for time in (0..length).rev() {
+                let state_base =
+                    (time + 1) * *hidden_size;
+                let previous_state_base =
+                    time * *hidden_size;
+
+                let mut gradient_pre =
+                    vec![0.0; *hidden_size];
+
+                for hidden in 0..*hidden_size {
+                    let state_value =
+                        states[state_base + hidden];
+                    gradient_pre[hidden] =
+                        (gradient_output[
+                            hidden * length + time
+                        ] + gradient_state[hidden])
+                            * (1.0 - state_value * state_value);
+                }
+
+                for hidden in 0..*hidden_size {
+                    let gradient_value =
+                        gradient_pre[hidden];
+
+                    for input_index in 0..*input_size {
+                        gradient_input[
+                            input_index * length
+                                + time
+                        ] += node.weights[
+                            hidden * *input_size
+                                + input_index
+                        ] * gradient_value;
+                    }
+
+                    let recurrent_base =
+                        input_weight_count
+                            + hidden * *hidden_size;
+
+                    for previous in 0..*hidden_size {
+                        gradient_state[previous] +=
+                            node.weights[
+                                recurrent_base + previous
+                            ] * gradient_value;
+                    }
+                }
+
+                let _ = previous_state_base;
+            }
+
+            Ok(vec![(node.inputs[0], gradient_input)])
+        }
+        TrainingCache::Add => {
+            Ok(node
+                .inputs
+                .iter()
+                .map(|input| {
+                    (*input, gradient_output.to_vec())
+                })
+                .collect())
+        }
+        TrainingCache::Activation { input } => {
+            let GraphOp::Activation { activation } = &node.op else {
+                anyhow::bail!(
+                    "activation cache does not match node {}",
+                    node.id
+                );
+            };
+
+            let gradient_input = input
+                .iter()
+                .zip(gradient_output.iter())
+                .map(|(value, gradient)| {
+                    *gradient * activation.derivative(*value)
+                })
+                .collect::<Vec<_>>();
+
+            Ok(vec![(node.inputs[0], gradient_input)])
+        }
+    }
+}
+
+fn parameter_gradients(
+    node: &GraphNode,
+    cache: &TrainingCache,
+    gradient_output: &[f32],
+) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    match cache {
+        TrainingCache::Input
+        | TrainingCache::Add
+        => Ok((
+            vec![0.0; node.weights.len()],
+            vec![0.0; node.bias.len()],
+        )),
+        TrainingCache::Activation { .. } => Ok((
+            Vec::new(),
+            Vec::new(),
+        )),
+        TrainingCache::Dense { input } => {
+            let GraphOp::Dense { input: width, output } = &node.op else {
+                anyhow::bail!("dense cache does not match node {}", node.id);
+            };
+            let mut gradient_weights =
+                vec![0.0; node.weights.len()];
+            let mut gradient_bias =
+                vec![0.0; node.bias.len()];
+
+            for o in 0..*output {
+                gradient_bias[o] = gradient_output[o];
+
+                for i in 0..*width {
+                    gradient_weights[
+                        o * *width + i
+                    ] = gradient_output[o] * input[i];
+                }
+            }
+
+            Ok((gradient_weights, gradient_bias))
+        }
+        TrainingCache::Conv1d { input } => {
+            let GraphOp::Conv1d {
+                input_channels,
+                output_channels,
+                kernel,
+                stride,
+            } = &node.op else {
+                anyhow::bail!("conv cache does not match node {}", node.id);
+            };
+
+            let length = input.len() / *input_channels;
+            let output_length =
+                (length - *kernel + *stride).div_ceil(*stride);
+            let mut gradient_weights =
+                vec![0.0; node.weights.len()];
+            let mut gradient_bias =
+                vec![0.0; node.bias.len()];
+
+            for oc in 0..*output_channels {
+                for pos in 0..output_length {
+                    let gradient_value =
+                        gradient_output[
+                            oc * output_length + pos
+                        ];
+                    gradient_bias[oc] +=
+                        gradient_value;
+
+                    for ic in 0..*input_channels {
+                        for k in 0..*kernel {
+                            let source =
+                                pos * *stride + k;
+
+                            if source < length {
+                                gradient_weights[
+                                    (oc * *input_channels
+                                        + ic) * *kernel
+                                        + k
+                                ] += gradient_value
+                                    * input[
+                                        ic * length
+                                            + source
+                                    ];
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok((gradient_weights, gradient_bias))
+        }
+        TrainingCache::SelfAttention {
+            input,
+            q,
+            k,
+            v,
+            probabilities,
+        } => {
+            let GraphOp::SelfAttention {
+                channels,
+                heads,
+            } = &node.op else {
+                anyhow::bail!(
+                    "attention cache does not match node {}",
+                    node.id
+                );
+            };
+
+            let length = input.len() / *channels;
+            let head_dim = *channels / *heads;
+            let mut gradient_q =
+                vec![0.0; q.len()];
+            let mut gradient_k =
+                vec![0.0; k.len()];
+            let mut gradient_v =
+                vec![0.0; v.len()];
+            let mut gradient_context =
+                vec![0.0; input.len()];
+            let output_base =
+                3 * *channels * *channels;
+            let mut gradient_weights =
+                vec![0.0; node.weights.len()];
+            let mut gradient_bias =
+                vec![0.0; node.bias.len()];
+
+            for seq in 0..length {
+                for row in 0..*channels {
+                    let gradient_value =
+                        gradient_output[
+                            row * length + seq
+                        ];
+                    gradient_bias[row] +=
+                        gradient_value;
+
+                    for column in 0..*channels {
+                        gradient_weights[
+                            output_base
+                                + row * *channels
+                                + column
+                        ] += gradient_value
+                            * (
+                                (0..*heads)
+                                    .flat_map(|_| {
+                                        std::iter::empty::<f32>()
+                                    })
+                                    .next()
+                                    .unwrap_or(0.0)
+                            );
+
+                        let _ = gradient_context[
+                            column * length + seq
+                        ];
+                    }
+                }
+            }
+
+            gradient_context.fill(0.0);
+
+            for seq in 0..length {
+                for row in 0..*channels {
+                    let gradient_value =
+                        gradient_output[
+                            row * length + seq
+                        ];
+
+                    for column in 0..*channels {
+                        gradient_context[
+                            column * length + seq
+                        ] += node.weights[
+                            output_base
+                                + row * *channels
+                                + column
+                        ] * gradient_value;
+                    }
+                }
+            }
+
+            for head in 0..*heads {
+                let start = head * head_dim;
+                let end = start + head_dim;
+
+                for query in 0..length {
+                    let mut gradient_probability =
+                        vec![0.0; length];
+
+                    for key in 0..length {
+                        for channel in start..end {
+                            gradient_v[
+                                channel * length + key
+                            ] += probabilities[
+                                (head * length + query)
+                                    * length
+                                    + key
+                            ] * gradient_context[
+                                channel * length + query
+                            ];
+
+                            gradient_probability[key] +=
+                                gradient_context[
+                                    channel * length + query
+                                ] * v[
+                                    channel * length + key
+                                ];
+                        }
+                    }
+
+                    let probability_base =
+                        (head * length + query)
+                            * length;
+                    let weighted_probability =
+                        gradient_probability
+                            .iter()
+                            .enumerate()
+                            .map(|(key, value)| {
+                                *value
+                                    * probabilities[
+                                        probability_base
+                                            + key
+                                    ]
+                            })
+                            .sum::<f32>();
+
+                    for key in 0..length {
+                        let probability =
+                            probabilities[
+                                probability_base + key
+                            ];
+                        let gradient_score =
+                            probability
+                                * (gradient_probability[key]
+                                    - weighted_probability);
+                        let scale =
+                            (head_dim as f32).sqrt();
+
+                        for channel in start..end {
+                            gradient_q[
+                                channel * length + query
+                            ] += gradient_score
+                                * k[
+                                    channel * length + key
+                                ] / scale;
+
+                            gradient_k[
+                                channel * length + key
+                            ] += gradient_score
+                                * q[
+                                    channel * length + query
+                                ] / scale;
+                        }
+                    }
+                }
+            }
+
+            let q_base = 0;
+            let k_base =
+                *channels * *channels;
+            let v_base =
+                2 * *channels * *channels;
+
+            for seq in 0..length {
+                for row in 0..*channels {
+                    let q_gradient =
+                        gradient_q[
+                            row * length + seq
+                        ];
+                    let k_gradient =
+                        gradient_k[
+                            row * length + seq
+                        ];
+                    let v_gradient =
+                        gradient_v[
+                            row * length + seq
+                        ];
+
+                    for column in 0..*channels {
+                        gradient_weights[
+                            q_base
+                                + row * *channels
+                                + column
+                        ] += q_gradient
+                            * input[
+                                column * length + seq
+                            ];
+                        gradient_weights[
+                            k_base
+                                + row * *channels
+                                + column
+                        ] += k_gradient
+                            * input[
+                                column * length + seq
+                            ];
+                        gradient_weights[
+                            v_base
+                                + row * *channels
+                                + column
+                        ] += v_gradient
+                            * input[
+                                column * length + seq
+                            ];
+                    }
+                }
+            }
+
+            for seq in 0..length {
+                for row in 0..*channels {
+                    let context_gradient =
+                        gradient_output[
+                            row * length + seq
+                        ];
+
+                    for column in 0..*channels {
+                        let mut context_value = 0.0;
+
+                        for head in 0..*heads {
+                            let start = head * head_dim;
+                            let end = start + head_dim;
+
+                            if (start..end).contains(&column) {
+                                context_value =
+                                    0.0;
+                                for key in 0..length {
+                                    context_value +=
+                                        probabilities[
+                                            (
+                                                head * length
+                                                    + seq
+                                            ) * length
+                                                + key
+                                        ] * v[
+                                            column * length
+                                                + key
+                                        ];
+                                }
+                            }
+                        }
+
+                        gradient_weights[
+                            output_base
+                                + row * *channels
+                                + column
+                        ] += context_gradient
+                            * context_value;
+                    }
+                }
+            }
+
+            Ok((gradient_weights, gradient_bias))
+        }
+        TrainingCache::Recurrent {
+            input,
+            states,
+        } => {
+            let GraphOp::Recurrent {
+                input_size,
+                hidden_size,
+            } = &node.op else {
+                anyhow::bail!(
+                    "recurrent cache does not match node {}",
+                    node.id
+                );
+            };
+
+            let length = input.len() / *input_size;
+            let input_weight_count =
+                *input_size * *hidden_size;
+            let mut gradient_weights =
+                vec![0.0; node.weights.len()];
+            let mut gradient_bias =
+                vec![0.0; node.bias.len()];
+            let mut gradient_state =
+                vec![0.0; *hidden_size];
+
+            for time in (0..length).rev() {
+                let state_base =
+                    (time + 1) * *hidden_size;
+                let mut gradient_pre =
+                    vec![0.0; *hidden_size];
+
+                for hidden in 0..*hidden_size {
+                    let state_value =
+                        states[state_base + hidden];
+                    gradient_pre[hidden] =
+                        (gradient_output[
+                            hidden * length + time
+                        ] + gradient_state[hidden])
+                            * (1.0 - state_value * state_value);
+                    gradient_bias[hidden] +=
+                        gradient_pre[hidden];
+
+                    for input_index in 0..*input_size {
+                        gradient_weights[
+                            hidden * *input_size
+                                + input_index
+                        ] += gradient_pre[hidden]
+                            * input[
+                                input_index * length
+                                    + time
+                            ];
+                    }
+
+                    let recurrent_base =
+                        input_weight_count
+                            + hidden * *hidden_size;
+
+                    for previous in 0..*hidden_size {
+                        gradient_weights[
+                            recurrent_base + previous
+                        ] += gradient_pre[hidden]
+                            * states[
+                                time * *hidden_size
+                                    + previous
+                            ];
+
+                        gradient_state[previous] +=
+                            node.weights[
+                                recurrent_base
+                                    + previous
+                            ] * gradient_pre[hidden];
+                    }
+                }
+            }
+
+            Ok((gradient_weights, gradient_bias))
+        }
+    }
+}
+
+fn self_attention_training_forward(
+    x: &[f32],
+    channels: usize,
+    heads: usize,
+    weights: &[f32],
+    bias: &[f32],
+) -> anyhow::Result<(
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+)> {
+    let length = x.len() / channels;
+    let head_dim = channels / heads;
+    let mut q = vec![0.0; channels * length];
+    let mut k = vec![0.0; channels * length];
+    let mut v = vec![0.0; channels * length];
+
+    for seq in 0..length {
+        for row in 0..channels {
+            let mut q_value = 0.0;
+            let mut k_value = 0.0;
+            let mut v_value = 0.0;
+
+            for column in 0..channels {
+                let x_value =
+                    x[column * length + seq];
+
+                q_value +=
+                    weights[
+                        row * channels + column
+                    ] * x_value;
+
+                k_value +=
+                    weights[
+                        channels * channels
+                            + row * channels
+                            + column
+                    ] * x_value;
+
+                v_value +=
+                    weights[
+                        2 * channels * channels
+                            + row * channels
+                            + column
+                    ] * x_value;
+            }
+
+            q[row * length + seq] = q_value;
+            k[row * length + seq] = k_value;
+            v[row * length + seq] = v_value;
+        }
+    }
+
+    let mut probabilities =
+        vec![0.0; heads * length * length];
+
+    for head in 0..heads {
+        let start = head * head_dim;
+        let end = start + head_dim;
+
+        for query in 0..length {
+            let mut scores = vec![0.0; length];
+
+            for key in 0..length {
+                let mut dot = 0.0;
+
+                for channel in start..end {
+                    dot +=
+                        q[channel * length + query]
+                            * k[channel * length + key];
+                }
+
+                scores[key] =
+                    dot / (head_dim as f32).sqrt();
+            }
+
+            softmax_in_place(&mut scores);
+
+            let base =
+                (head * length + query)
+                    * length;
+
+            probabilities[
+                base..base + length
+            ]
+                .copy_from_slice(&scores);
+        }
+    }
+
+    let mut context =
+        vec![0.0; channels * length];
+
+    for head in 0..heads {
+        let start = head * head_dim;
+        let end = start + head_dim;
+
+        for query in 0..length {
+            let base =
+                (head * length + query)
+                    * length;
+
+            for channel in start..end {
+                context[
+                    channel * length + query
+                ] = (0..length)
+                    .map(|key| {
+                        probabilities[
+                            base + key
+                        ] * v[
+                            channel * length + key
+                        ]
+                    })
+                    .sum();
+            }
+        }
+    }
+
+    let output_base =
+        3 * channels * channels;
+    let mut y =
+        vec![0.0; channels * length];
+
+    for seq in 0..length {
+        for row in 0..channels {
+            let mut sum =
+                bias[row];
+
+            for column in 0..channels {
+                sum +=
+                    weights[
+                        output_base
+                            + row * channels
+                            + column
+                    ] * context[
+                        column * length + seq
+                    ];
+            }
+
+            y[row * length + seq] =
+                sum;
+        }
+    }
+
+    Ok((
+        y,
+        q,
+        k,
+        v,
+        probabilities,
+    ))
+}
+
+fn recurrent_training_forward(
+    x: &[f32],
+    input_size: usize,
+    hidden_size: usize,
+    weights: &[f32],
+    bias: &[f32],
+) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    let length = x.len() / input_size;
+    let input_weight_count =
+        input_size * hidden_size;
+    let mut states =
+        vec![0.0; (length + 1) * hidden_size];
+
+    for time in 0..length {
+        for hidden in 0..hidden_size {
+            let mut sum = bias[hidden];
+
+            for input_index in 0..input_size {
+                sum += weights[
+                    hidden * input_size
+                        + input_index
+                ] * x[
+                    input_index * length
+                        + time
+                ];
+            }
+
+            let recurrent_base =
+                input_weight_count
+                    + hidden * hidden_size;
+
+            for previous in 0..hidden_size {
+                sum += weights[
+                    recurrent_base + previous
+                ] * states[
+                    time * hidden_size + previous
+                ];
+            }
+
+            states[
+                (time + 1) * hidden_size + hidden
+            ] = sum.tanh();
+        }
+    }
+
+    let output = (0..length)
+        .flat_map(|time| {
+            (0..hidden_size).map(
+                move |hidden| {
+                    states[
+                        (time + 1)
+                            * hidden_size
+                            + hidden
+                    ]
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut channel_major =
+        vec![0.0; output.len()];
+
+    for time in 0..length {
+        for hidden in 0..hidden_size {
+            channel_major[
+                hidden * length + time
+            ] = output[
+                time * hidden_size + hidden
+            ];
+        }
+    }
+
+    Ok((channel_major, states))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GraphMutation {
     RewireInput {
