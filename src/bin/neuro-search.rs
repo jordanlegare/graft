@@ -5,7 +5,7 @@ use graft::{
     energy::HardwareProfile,
     graft::GuidedMutationConfig,
     model::{Activation, DenseLayer, Network},
-    search::{mse, search, SearchCandidate, SearchConfig},
+    search::{evaluate_holdout, mse, search, SearchCandidate, SearchConfig},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -78,6 +78,15 @@ struct Args {
 
     #[arg(long, default_value_t = 0.01)]
     behavior_merge_tolerance: f32,
+
+    #[arg(long, default_value_t = 0.15)]
+    validation_fraction: f32,
+
+    #[arg(long, default_value_t = 0.15)]
+    holdout_fraction: f32,
+
+    #[arg(long, default_value_t = 42)]
+    split_seed: u64,
 
     #[arg(long)]
     export_best_dir: Option<String>,
@@ -327,6 +336,7 @@ fn export_candidate(
         active_edges_per_layer: Vec<usize>,
         mutations: Vec<String>,
         mse: f32,
+        holdout_mse: Option<f32>,
         energy_pj: f64,
     }
 
@@ -336,6 +346,7 @@ fn export_candidate(
             candidate.network.active_edges_per_layer(),
         mutations: candidate.result.mutations.clone(),
         mse: candidate.result.mse,
+        holdout_mse: candidate.result.holdout_mse,
         energy_pj: candidate.result.energy_pj,
     };
 
@@ -383,6 +394,20 @@ fn main() -> Result<()> {
         "behavior_merge_tolerance must be non-negative"
     );
     anyhow::ensure!(
+        args.validation_fraction > 0.0
+            && args.validation_fraction < 1.0,
+        "validation_fraction must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        args.holdout_fraction > 0.0
+            && args.holdout_fraction < 1.0,
+        "holdout_fraction must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        args.validation_fraction + args.holdout_fraction < 1.0,
+        "validation_fraction + holdout_fraction must be less than 1"
+    );
+    anyhow::ensure!(
         args.min_width >= 1,
         "min_width must be at least 1"
     );
@@ -397,6 +422,12 @@ fn main() -> Result<()> {
         serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
 
     let dataset = Dataset::load(&args.dataset)?;
+    let (train_dataset, validation_dataset, holdout_dataset) =
+        dataset.split_three_way(
+            args.validation_fraction,
+            args.holdout_fraction,
+            args.split_seed,
+        )?;
     let baseline = load_network(&manifest_path, &manifest)?;
     let hardware = HardwareProfile::load(args.hardware.as_deref())?;
 
@@ -421,7 +452,8 @@ fn main() -> Result<()> {
         "no activation candidates supplied"
     );
 
-    let baseline_mse = mse(&baseline, &dataset);
+    let baseline_validation_mse = mse(&baseline, &validation_dataset);
+    let baseline_holdout_mse = mse(&baseline, &holdout_dataset);
     let baseline_energy =
         graft::energy::estimate_energy(
             &baseline,
@@ -440,7 +472,20 @@ fn main() -> Result<()> {
         "  active connections: {}",
         baseline.active_connection_count()
     );
-    println!("  MSE: {:.8}", baseline_mse);
+    println!(
+        "  train/validation/holdout samples: {}/{}/{}",
+        train_dataset.inputs.len(),
+        validation_dataset.inputs.len(),
+        holdout_dataset.inputs.len()
+    );
+    println!(
+        "  validation MSE: {:.8}",
+        baseline_validation_mse
+    );
+    println!(
+        "  holdout MSE: {:.8}",
+        baseline_holdout_mse
+    );
     println!(
         "  estimated energy: {:.3} pJ",
         baseline_energy
@@ -471,13 +516,16 @@ fn main() -> Result<()> {
         },
     };
 
-    let results =
+    let mut results =
         search(
-            &dataset,
+            &train_dataset,
+            &validation_dataset,
             &config,
             &hardware,
             &baseline,
         );
+
+    evaluate_holdout(&mut results, &holdout_dataset);
 
     println!();
     println!("Top candidates:");
@@ -486,13 +534,14 @@ fn main() -> Result<()> {
         let result = &candidate.result;
 
         println!(
-            "#{:03} origin={} topology={:?} active={} params={} mse={:.6} energy={:.3} pJ accepted={} mutations={:?}",
+            "#{:03} origin={} topology={:?} active={} params={} validation_mse={:.6} holdout_mse={:.6} energy={:.3} pJ accepted={} mutations={:?}",
             result.id,
             result.origin,
             result.topology,
             result.active_connections,
             result.parameters,
             result.mse,
+            result.holdout_mse.unwrap_or(f32::NAN),
             result.energy_pj,
             result.accuracy_accepted,
             result.mutations
@@ -523,7 +572,14 @@ fn main() -> Result<()> {
             "  active connections: {}",
             best.result.active_connections
         );
-        println!("  MSE: {:.8}", best.result.mse);
+        println!(
+            "  validation MSE: {:.8}",
+            best.result.mse
+        );
+        println!(
+            "  holdout MSE: {:.8}",
+            best.result.holdout_mse.unwrap_or(f32::NAN)
+        );
         println!(
             "  estimated energy: {:.3} pJ",
             best.result.energy_pj
