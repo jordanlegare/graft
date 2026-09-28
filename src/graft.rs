@@ -78,59 +78,6 @@ impl Default for GuidedMutationConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct NeuronScore {
-    layer: usize,
-    neuron: usize,
-    utility: f32,
-}
-
-fn hidden_layer_indices(network: &Network) -> impl Iterator<Item = usize> {
-    0..network.layers.len().saturating_sub(1)
-}
-
-fn neuron_utility(network: &Network, layer_idx: usize, neuron: usize) -> f32 {
-    let layer = &network.layers[layer_idx];
-
-    let incoming = (0..layer.input)
-        .filter_map(|input| {
-            let idx = neuron * layer.input + input;
-            layer.active[idx].then_some(layer.weights[idx].abs())
-        })
-        .sum::<f32>();
-
-    let bias = layer.bias[neuron].abs();
-
-    let outgoing = if layer_idx + 1 < network.layers.len() {
-        let next = &network.layers[layer_idx + 1];
-
-        (0..next.output)
-            .filter_map(|output| {
-                let idx = output * next.input + neuron;
-                next.active[idx].then_some(next.weights[idx].abs())
-            })
-            .sum::<f32>()
-    } else {
-        0.0
-    };
-
-    (incoming + bias + 1e-6) * (outgoing + 1e-6)
-}
-
-fn all_neuron_scores(network: &Network) -> Vec<NeuronScore> {
-    hidden_layer_indices(network)
-        .flat_map(|layer_idx| {
-            let width = network.layers[layer_idx].output;
-
-            (0..width).map(move |neuron| NeuronScore {
-                layer: layer_idx,
-                neuron,
-                utility: neuron_utility(network, layer_idx, neuron),
-            })
-        })
-        .collect()
-}
-
 pub fn neuron_utilities(network: &Network) -> Vec<Vec<f32>> {
     hidden_layer_indices(network)
         .map(|layer_idx| {
@@ -204,66 +151,6 @@ fn neuron_similarity(network: &Network, layer_idx: usize, a: usize, b: usize) ->
     cosine_similarity(&left, &right)
 }
 
-fn most_similar_pair(
-    network: &Network,
-    min_width: usize,
-    threshold: f32,
-) -> Option<(usize, usize, usize, f32)> {
-    let mut best: Option<(usize, usize, usize, f32)> = None;
-
-    for layer_idx in hidden_layer_indices(network) {
-        let width = network.layers[layer_idx].output;
-
-        if width <= min_width {
-            continue;
-        }
-
-        for a in 0..width {
-            for b in (a + 1)..width {
-                let similarity = neuron_similarity(network, layer_idx, a, b);
-
-                if similarity >= threshold
-                    && best.is_none_or(|current| similarity > current.3)
-                {
-                    best = Some((layer_idx, a, b, similarity));
-                }
-            }
-        }
-    }
-
-    best
-}
-
-fn weakest_neuron(
-    network: &Network,
-    min_width: usize,
-) -> Option<(usize, usize, f32)> {
-    all_neuron_scores(network)
-        .into_iter()
-        .filter(|score| network.layers[score.layer].output > min_width)
-        .min_by(|a, b| {
-            a.utility
-                .partial_cmp(&b.utility)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|score| (score.layer, score.neuron, score.utility))
-}
-
-fn strongest_neuron(
-    network: &Network,
-    max_width: usize,
-) -> Option<(usize, usize, f32)> {
-    all_neuron_scores(network)
-        .into_iter()
-        .filter(|score| network.layers[score.layer].output < max_width)
-        .max_by(|a, b| {
-            a.utility
-                .partial_cmp(&b.utility)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|score| (score.layer, score.neuron, score.utility))
-}
-
 fn eligible_edge_prune(layer: &DenseLayer, output: usize, input: usize) -> bool {
     let idx = layer.index(output, input);
 
@@ -304,29 +191,6 @@ fn weakest_connection(network: &Network) -> Option<(usize, usize, usize)> {
     }
 
     best.map(|(layer, output, input, _)| (layer, output, input))
-}
-
-fn inactive_edge<R: Rng>(
-    network: &Network,
-    layer_idx: usize,
-    rng: &mut R,
-) -> Option<(usize, usize, usize)> {
-    let mut candidates = Vec::new();
-    let layer = &network.layers[layer_idx];
-
-    for output in 0..layer.output {
-        for input in 0..layer.input {
-            if !layer.is_active(output, input) {
-                candidates.push((layer_idx, output, input));
-            }
-        }
-    }
-
-    if candidates.is_empty() {
-        None
-    } else {
-        Some(candidates[rng.random_range(0..candidates.len())])
-    }
 }
 
 fn remove_row(layer: &mut DenseLayer, row: usize) {
@@ -973,8 +837,19 @@ fn behavior_merge_pair(
                 let correlation =
                     activation_correlation(trace, first, second);
 
-                if correlation >= config.behavior_correlation_threshold {
-                    pairs.push((layer, first, second, correlation));
+                let parameter_similarity =
+                    neuron_similarity(network, layer, first, second);
+
+                if correlation >= config.behavior_correlation_threshold
+                    && parameter_similarity >= config.similarity_threshold
+                {
+                    pairs.push((
+                        layer,
+                        first,
+                        second,
+                        correlation,
+                        parameter_similarity,
+                    ));
                 }
             }
         }
@@ -1008,11 +883,18 @@ fn behavior_merge_pair(
                     || (correlation == current.3 && delta < current.4)
             })
         {
-            best = Some((layer, first, second, correlation, delta));
+            best = Some((
+                layer,
+                first,
+                second,
+                correlation,
+                parameter_similarity,
+                delta,
+            ));
         }
     }
 
-    best.map(|(layer, first, second, correlation, _)| {
+    best.map(|(layer, first, second, correlation, _, _)| {
         (layer, first, second, correlation)
     })
 }
@@ -1089,12 +971,11 @@ fn behavior_prunable_connection(
     best
 }
 
-fn behavior_rewire<R: Rng>(
+fn behavior_rewire(
     network: &Network,
     profile: &BehaviorProfile,
     config: &GuidedMutationConfig,
     dataset: &Dataset,
-    rng: &mut R,
 ) -> Option<MutationKind> {
     let source =
         behavior_prunable_connection(
@@ -1137,8 +1018,6 @@ fn behavior_rewire<R: Rng>(
     }
 
     let (target_output, target_input, _) = best_target?;
-    let _ = rng;
-
     Some(MutationKind::RewireConnection {
         layer,
         from_output: source.1,
@@ -1193,7 +1072,6 @@ pub fn apply_guided_mutation<R: Rng>(
             &profile,
             config,
             dataset,
-            rng,
         );
 
     let mut choices = Vec::new();
