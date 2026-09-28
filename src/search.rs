@@ -41,6 +41,7 @@ pub struct CandidateResult {
     pub active_connections: usize,
     pub macs: u64,
     pub mse: f32,
+    pub holdout_mse: Option<f32>,
     pub energy_pj: f64,
     pub accuracy_accepted: bool,
 }
@@ -236,12 +237,13 @@ fn train_sample(
 }
 
 pub fn search(
-    dataset: &Dataset,
+    train_dataset: &Dataset,
+    validation_dataset: &Dataset,
     cfg: &SearchConfig,
     hardware: &HardwareProfile,
     baseline: &Network,
 ) -> Vec<SearchCandidate> {
-    let baseline_error = mse(baseline, dataset);
+    let baseline_error = mse(baseline, validation_dataset);
     let mut rng = rand::rng();
     let mut results = Vec::with_capacity(cfg.candidates);
 
@@ -262,7 +264,7 @@ pub fn search(
                 let history = apply_guided_mutations(
                     &mut candidate,
                     &cfg.guided_config,
-                    dataset,
+                    validation_dataset,
                     mutation_count,
                     &mut rng,
                 );
@@ -306,12 +308,12 @@ pub fn search(
 
         train(
             &mut candidate,
-            dataset,
+            train_dataset,
             cfg.epochs,
             cfg.learning_rate,
         );
 
-        let candidate_mse = mse(&candidate, dataset);
+        let candidate_mse = mse(&candidate, validation_dataset);
         let energy =
             estimate_energy(&candidate, hardware, cfg.batch_size);
 
@@ -326,6 +328,7 @@ pub fn search(
             active_connections: candidate.active_connection_count(),
             macs: candidate.mac_count(),
             mse: candidate_mse,
+            holdout_mse: None,
             energy_pj: energy,
             accuracy_accepted:
                 candidate_mse <= baseline_error + cfg.accuracy_tolerance,
@@ -353,4 +356,15 @@ pub fn search(
     });
 
     results
+}
+
+
+pub fn evaluate_holdout(
+    results: &mut [SearchCandidate],
+    holdout_dataset: &Dataset,
+) {
+    for candidate in results {
+        candidate.result.holdout_mse =
+            Some(mse(&candidate.network, holdout_dataset));
+    }
 }
