@@ -119,9 +119,16 @@ fn read_f32_file(path: &Path) -> Result<Vec<f32>> {
         bytes.len()
     );
 
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    anyhow::ensure!(
+        remainder.is_empty(),
+        "{} contains a partial f32 value",
+        path.display()
+    );
+
+    Ok(chunks
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect())
 }
 
