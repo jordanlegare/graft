@@ -865,7 +865,7 @@ fn behavior_merge_pair(
 
     let mut best = None;
 
-    for (layer, first, second, correlation) in
+    for (layer, first, second, correlation, parameter_similarity) in
         pairs.into_iter().take(limit)
     {
         let mut candidate = network.clone();
@@ -878,10 +878,20 @@ fn behavior_merge_pair(
         ) - profile.baseline_mse;
 
         if delta <= config.behavior_merge_tolerance
-            && best.is_none_or(|current: (usize, usize, usize, f32, f32)| {
-                correlation > current.3
-                    || (correlation == current.3 && delta < current.4)
-            })
+            && best.is_none_or(
+                |current: (usize, usize, usize, f32, f32, f32)| {
+                    correlation > current.3
+                        || (
+                            correlation == current.3
+                                && parameter_similarity > current.4
+                        )
+                        || (
+                            correlation == current.3
+                                && parameter_similarity == current.4
+                                && delta < current.5
+                        )
+                },
+            )
         {
             best = Some((
                 layer,
