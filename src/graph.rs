@@ -480,6 +480,7 @@ impl GraphNetwork {
         rng: &mut impl Rng,
     ) -> anyhow::Result<()> {
         let node_index = self.index_of(node_id)?;
+        let old_shape = self.infer_shapes()?[&node_id];
         let input_shape = {
             let node = &self.nodes[node_index];
             if node.inputs.len() == 1 {
@@ -502,6 +503,11 @@ impl GraphNetwork {
         let mut candidate = self.clone();
         candidate.nodes[node_index] = replacement;
         candidate.validate()?;
+        anyhow::ensure!(
+            candidate.infer_shapes()?[&node_id] == old_shape,
+            "replacement changes node {} shape",
+            node_id
+        );
         *self = candidate;
         Ok(())
     }
@@ -513,6 +519,7 @@ impl GraphNetwork {
         new_input: usize,
     ) -> anyhow::Result<()> {
         let node_index = self.index_of(node_id)?;
+        let old_output_shape = self.output_shape()?;
         anyhow::ensure!(
             new_input != node_id,
             "node cannot consume itself"
@@ -526,6 +533,10 @@ impl GraphNetwork {
         let mut candidate = self.clone();
         candidate.nodes[node_index].inputs[slot] = new_input;
         candidate.validate()?;
+        anyhow::ensure!(
+            candidate.output_shape()? == old_output_shape,
+            "rewire changes graph output shape"
+        );
         *self = candidate;
         Ok(())
     }
@@ -570,6 +581,7 @@ impl GraphNetwork {
         node_id: usize,
         replacement: usize,
     ) -> anyhow::Result<()> {
+        let old_output_shape = self.output_shape()?;
         anyhow::ensure!(node_id != replacement, "replacement matches removed node");
         anyhow::ensure!(
             self.output != node_id || replacement != node_id,
@@ -608,6 +620,10 @@ impl GraphNetwork {
         }
 
         candidate.validate()?;
+        anyhow::ensure!(
+            candidate.output_shape()? == old_output_shape,
+            "removal changes graph output shape"
+        );
         *self = candidate;
         Ok(())
     }
@@ -704,7 +720,7 @@ impl GraphNetwork {
                         GraphOp::Conv1d {
                             input_channels: shape.channels,
                             output_channels: shape.channels,
-                            kernel: 3.min(shape.length),
+                            kernel: 1,
                             stride: 1,
                         }
                     }
@@ -836,8 +852,13 @@ impl GraphNetwork {
                 self.replace_op(*node, op.clone(), rng)
             }
             GraphMutation::AddResidual { left, right } => {
-                self.add_node(GraphOp::Add, vec![*left, *right], rng)
-                    .map(|_| ())
+                let id = self.add_node(
+                    GraphOp::Add,
+                    vec![*left, *right],
+                    rng,
+                )?;
+                self.output = id;
+                self.validate()
             }
             GraphMutation::RemoveNode {
                 node,
@@ -964,7 +985,7 @@ pub fn random_graph<R: Rng>(
 
 fn parameter_layout(
     op: &GraphOp,
-    input_shape: Option<TensorShape>,
+    _input_shape: Option<TensorShape>,
 ) -> anyhow::Result<(usize, usize, f32)> {
     match op {
         GraphOp::Input { .. }
