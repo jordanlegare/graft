@@ -295,7 +295,10 @@ fn weakest_connection(network: &Network) -> Option<(usize, usize, usize)> {
     best.map(|(layer, output, input, _)| (layer, output, input))
 }
 
-fn inactive_edge(network: &Network) -> Option<(usize, usize, usize)> {
+fn inactive_edge<R: Rng>(
+    network: &Network,
+    rng: &mut R,
+) -> Option<(usize, usize, usize)> {
     let mut candidates = Vec::new();
 
     for layer_idx in 0..network.layers.len() {
@@ -313,7 +316,7 @@ fn inactive_edge(network: &Network) -> Option<(usize, usize, usize)> {
     if candidates.is_empty() {
         None
     } else {
-        Some(candidates[rand::rng().random_range(0..candidates.len())])
+        Some(candidates[rng.random_range(0..candidates.len())])
     }
 }
 
@@ -690,11 +693,8 @@ pub fn apply_guided_mutation<R: Rng>(
         choices.push(3usize);
     }
 
-    if let Some(source) = weakest_connection(network) {
-        if inactive_edge(network).is_some() {
-            let _ = source;
-            choices.push(4usize);
-        }
+    if weakest_connection(network).is_some() && inactive_edge(network, rng).is_some() {
+        choices.push(4usize);
     }
 
     if choices.is_empty() {
@@ -737,7 +737,7 @@ pub fn apply_guided_mutation<R: Rng>(
         }
         4 => {
             let source = weakest_connection(network)?;
-            let target = inactive_edge(network)?;
+            let target = inactive_edge(network, rng)?;
             let (layer, output, input) = source;
             let (_, target_output, target_input) = target;
 
