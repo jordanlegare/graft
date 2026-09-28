@@ -410,7 +410,7 @@ impl GraphNetwork {
                 GraphOp::SelfAttention { channels, heads } => {
                     let x = single_input(&values, node)?.to_vec();
                     self_attention(
-                        x,
+                        &x,
                         *channels,
                         *heads,
                         &node.weights,
@@ -423,7 +423,7 @@ impl GraphNetwork {
                 } => {
                     let x = single_input(&values, node)?.to_vec();
                     recurrent(
-                        x,
+                        &x,
                         *input_size,
                         *hidden_size,
                         &node.weights,
@@ -2194,8 +2194,8 @@ fn recurrent_training_forward(
         for hidden in 0..hidden_size {
             channel_major[
                 hidden * length + time
-            ] = output[
-                time * hidden_size + hidden
+            ] = states[
+                (time + 1) * hidden_size + hidden
             ];
         }
     }
