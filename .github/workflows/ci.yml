@@ -48,4 +48,8 @@ jobs:
           --guided-fraction 0.75
           --guided-mutations 3
           --similarity-threshold 0.85
+          --behavior-samples 128
+          --behavior-candidates 8
+          --behavior-correlation-threshold 0.90
+          --behavior-merge-tolerance 0.01
           --export-best-dir grafted
