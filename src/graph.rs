@@ -582,7 +582,7 @@ impl GraphNetwork {
             .ok_or_else(|| anyhow::anyhow!("unknown node {}", node_id))?;
 
         anyhow::ensure!(
-            !matches!(removed.op, GraphOp::Input { .. }),
+            !matches!(&removed.op, GraphOp::Input { .. }),
             "input node cannot be removed"
         );
         anyhow::ensure!(
@@ -640,7 +640,7 @@ impl GraphNetwork {
         let selectable = self
             .nodes
             .iter()
-            .filter(|node| !matches!(node.op, GraphOp::Input { .. }))
+            .filter(|node| !matches!(&node.op, GraphOp::Input { .. }))
             .collect::<Vec<_>>();
 
         if selectable.is_empty() {
@@ -1527,7 +1527,7 @@ pub fn search_graph<R: Rng>(
     Ok(results)
 }
 
-fn graph_mse(
+pub fn graph_mse(
     network: &GraphNetwork,
     inputs: &[Vec<f32>],
     targets: &[Vec<f32>],
