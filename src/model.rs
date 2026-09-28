@@ -66,7 +66,7 @@ pub struct DenseLayer {
     pub activation: Activation,
 
     // Explicit connection support. A false entry represents a pruned edge.
-    // Weight values are retained for reversible experimentation/export.
+    // Inactive weights are set to zero and exported together with the mask.
     pub active: Vec<bool>,
 }
 
