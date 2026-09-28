@@ -120,3 +120,6 @@ infer convolutional, attention, recurrent, residual, or arbitrary DAG graphs.
 The next graft stage should use the trained parameters themselves to drive
 topology mutation: neuron pruning, neuron merging, neuron splitting, connection
 rewiring, and parameter transplantation instead of random reinitialization.
+
+CI verification for the repository build and seed/search smoke test is defined
+in .github/workflows/ci.yml.
