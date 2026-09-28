@@ -34,6 +34,9 @@ jobs:
       - name: Generate ONNX seed
         run: cargo run --release --bin onnx-seed
 
+      - name: Generate general graph seed
+        run: cargo run --release --bin graph-seed
+
       - name: Smoke-test search
         run: >
           cargo run --release --bin neuro-search --
@@ -56,3 +59,18 @@ jobs:
           --holdout-fraction 0.15
           --split-seed 42
           --export-best-dir grafted
+
+
+      - name: Smoke-test graph search
+        run: >
+          cargo run --release --bin graph-search --
+          --graph seed/graph.json
+          --dataset seed/graph-dataset.json
+          --candidates 8
+          --mutations 3
+          --accuracy-tolerance 0.05
+          --validation-fraction 0.15
+          --holdout-fraction 0.15
+          --split-seed 42
+          --export-best seed/grafted-graph.json
+          --output graph-results.json
