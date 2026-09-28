@@ -157,3 +157,5 @@ implemented.
 
 The intended next stage is hardware-aware compilation of the exported masks
 and sparse weights, followed by real-device energy measurement.
+
+CI formats the workspace before compile and test.
