@@ -691,10 +691,10 @@ pub fn apply_guided_mutation<R: Rng>(
         choices.push(3usize);
     }
 
-    if let Some((source_layer, _, _)) = weakest_connection(network) {
-        if inactive_edge(network, source_layer, rng).is_some() {
-            choices.push(4usize);
-        }
+    if let Some((source_layer, _, _)) = weakest_connection(network)
+        && inactive_edge(network, source_layer, rng).is_some()
+    {
+        choices.push(4usize);
     }
 
     if choices.is_empty() {
