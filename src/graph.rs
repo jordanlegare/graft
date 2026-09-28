@@ -1698,20 +1698,50 @@ fn parameter_gradients(
 
             let length = input.len() / *channels;
             let head_dim = *channels / *heads;
+            let output_base = 3 * *channels * *channels;
+            let mut gradient_weights =
+                vec![0.0; node.weights.len()];
+            let mut gradient_bias =
+                vec![0.0; node.bias.len()];
+            let mut gradient_context =
+                vec![0.0; input.len()];
             let mut gradient_q =
                 vec![0.0; q.len()];
             let mut gradient_k =
                 vec![0.0; k.len()];
             let mut gradient_v =
                 vec![0.0; v.len()];
-            let mut gradient_context =
-                vec![0.0; input.len()];
-            let output_base =
-                3 * *channels * *channels;
-            let mut gradient_weights =
-                vec![0.0; node.weights.len()];
-            let mut gradient_bias =
-                vec![0.0; node.bias.len()];
+
+            for head in 0..*heads {
+                let start_channel = head * head_dim;
+                let end_channel =
+                    start_channel + head_dim;
+
+                for query in 0..length {
+                    let base =
+                        (head * length + query)
+                            * length;
+
+                    for channel in
+                        start_channel..end_channel
+                    {
+                        let gradient_value =
+                            gradient_output[
+                                channel * length
+                                    + query
+                            ];
+
+                        for key in 0..length {
+                            gradient_v[
+                                channel * length
+                                    + key
+                            ] += probabilities[
+                                base + key
+                            ] * gradient_value;
+                        }
+                    }
+                }
+            }
 
             for seq in 0..length {
                 for row in 0..*channels {
@@ -1723,37 +1753,23 @@ fn parameter_gradients(
                         gradient_value;
 
                     for column in 0..*channels {
+                        let context_value = attention_context_value(
+                            channels,
+                            heads,
+                            length,
+                            probabilities,
+                            v,
+                            column,
+                            seq,
+                        );
+
                         gradient_weights[
                             output_base
                                 + row * *channels
                                 + column
                         ] += gradient_value
-                            * (
-                                (0..*heads)
-                                    .flat_map(|_| {
-                                        std::iter::empty::<f32>()
-                                    })
-                                    .next()
-                                    .unwrap_or(0.0)
-                            );
+                            * context_value;
 
-                        let _ = gradient_context[
-                            column * length + seq
-                        ];
-                    }
-                }
-            }
-
-            gradient_context.fill(0.0);
-
-            for seq in 0..length {
-                for row in 0..*channels {
-                    let gradient_value =
-                        gradient_output[
-                            row * length + seq
-                        ];
-
-                    for column in 0..*channels {
                         gradient_context[
                             column * length + seq
                         ] += node.weights[
@@ -1766,37 +1782,37 @@ fn parameter_gradients(
             }
 
             for head in 0..*heads {
-                let start = head * head_dim;
-                let end = start + head_dim;
+                let start_channel = head * head_dim;
+                let end_channel =
+                    start_channel + head_dim;
 
                 for query in 0..length {
+                    let base =
+                        (head * length + query)
+                            * length;
                     let mut gradient_probability =
                         vec![0.0; length];
 
                     for key in 0..length {
-                        for channel in start..end {
-                            gradient_v[
-                                channel * length + key
-                            ] += probabilities[
-                                (head * length + query)
-                                    * length
-                                    + key
-                            ] * gradient_context[
-                                channel * length + query
-                            ];
+                        let probability =
+                            probabilities[base + key];
 
+                        for channel in
+                            start_channel..end_channel
+                        {
                             gradient_probability[key] +=
                                 gradient_context[
-                                    channel * length + query
+                                    channel * length
+                                        + query
                                 ] * v[
-                                    channel * length + key
+                                    channel * length
+                                        + key
                                 ];
                         }
+
+                        let _ = probability;
                     }
 
-                    let probability_base =
-                        (head * length + query)
-                            * length;
                     let weighted_probability =
                         gradient_probability
                             .iter()
@@ -1804,17 +1820,14 @@ fn parameter_gradients(
                             .map(|(key, value)| {
                                 *value
                                     * probabilities[
-                                        probability_base
-                                            + key
+                                        base + key
                                     ]
                             })
                             .sum::<f32>();
 
                     for key in 0..length {
                         let probability =
-                            probabilities[
-                                probability_base + key
-                            ];
+                            probabilities[base + key];
                         let gradient_score =
                             probability
                                 * (gradient_probability[key]
@@ -1822,114 +1835,61 @@ fn parameter_gradients(
                         let scale =
                             (head_dim as f32).sqrt();
 
-                        for channel in start..end {
+                        for channel in
+                            start_channel..end_channel
+                        {
                             gradient_q[
-                                channel * length + query
+                                channel * length
+                                    + query
                             ] += gradient_score
                                 * k[
-                                    channel * length + key
+                                    channel * length
+                                        + key
                                 ] / scale;
 
                             gradient_k[
                                 channel * length + key
                             ] += gradient_score
                                 * q[
-                                    channel * length + query
+                                    channel * length
+                                        + query
                                 ] / scale;
                         }
                     }
                 }
             }
 
-            let q_base = 0;
-            let k_base =
-                *channels * *channels;
-            let v_base =
-                2 * *channels * *channels;
-
             for seq in 0..length {
                 for row in 0..*channels {
-                    let q_gradient =
-                        gradient_q[
-                            row * length + seq
-                        ];
-                    let k_gradient =
-                        gradient_k[
-                            row * length + seq
-                        ];
-                    let v_gradient =
-                        gradient_v[
-                            row * length + seq
-                        ];
-
                     for column in 0..*channels {
                         gradient_weights[
-                            q_base
-                                + row * *channels
+                            row * *channels
                                 + column
-                        ] += q_gradient
-                            * input[
-                                column * length + seq
-                            ];
-                        gradient_weights[
-                            k_base
-                                + row * *channels
-                                + column
-                        ] += k_gradient
-                            * input[
-                                column * length + seq
-                            ];
-                        gradient_weights[
-                            v_base
-                                + row * *channels
-                                + column
-                        ] += v_gradient
-                            * input[
-                                column * length + seq
-                            ];
-                    }
-                }
-            }
-
-            for seq in 0..length {
-                for row in 0..*channels {
-                    let context_gradient =
-                        gradient_output[
+                        ] += gradient_q[
                             row * length + seq
+                        ] * input[
+                            column * length + seq
                         ];
 
-                    for column in 0..*channels {
-                        let mut context_value = 0.0;
-
-                        for head in 0..*heads {
-                            let start = head * head_dim;
-                            let end = start + head_dim;
-
-                            if (start..end).contains(&column) {
-                                context_value =
-                                    0.0;
-                                for key in 0..length {
-                                    context_value +=
-                                        probabilities[
-                                            (
-                                                head * length
-                                                    + seq
-                                            ) * length
-                                                + key
-                                        ] * v[
-                                            column * length
-                                                + key
-                                        ];
-                                }
-                            }
-                        }
-
                         gradient_weights[
-                            output_base
+                            *channels * *channels
                                 + row * *channels
                                 + column
-                        ] += context_gradient
-                            * context_value;
+                        ] += gradient_k[
+                            row * length + seq
+                        ] * input[
+                            column * length + seq
+                        ];
+
+                        gradient_weights[
+                            2 * *channels * *channels
+                                + row * *channels
+                                + column
+                        ] += gradient_v[
+                            row * length + seq
+                        ] * input[
+                            column * length + seq
+                        ];
                     }
                 }
             }
@@ -2013,6 +1973,28 @@ fn parameter_gradients(
             Ok((gradient_weights, gradient_bias))
         }
     }
+}
+
+fn attention_context_value(
+    channels: &usize,
+    heads: &usize,
+    length: usize,
+    probabilities: &[f32],
+    values: &[f32],
+    channel: usize,
+    query: usize,
+) -> f32 {
+    let head_dim = *channels / *heads;
+    let head = channel / head_dim;
+    let base =
+        (head * length + query) * length;
+
+    (0..length)
+        .map(|key| {
+            probabilities[base + key]
+                * values[channel * length + key]
+        })
+        .sum()
 }
 
 fn self_attention_training_forward(
