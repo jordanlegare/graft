@@ -262,6 +262,7 @@ pub fn search(
                 let history = apply_guided_mutations(
                     &mut candidate,
                     &cfg.guided_config,
+                    dataset,
                     mutation_count,
                     &mut rng,
                 );
