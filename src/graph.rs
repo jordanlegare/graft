@@ -296,7 +296,9 @@ impl GraphNetwork {
                     kernel,
                     stride,
                 } => {
-                    let input = node.inputs.first()?;
+                    let Some(input) = node.inputs.first() else {
+                        return 0;
+                    };
                     let Some(shape) = shapes.get(input) else {
                         return 0;
                     };
@@ -309,7 +311,9 @@ impl GraphNetwork {
                         * kernel) as u64
                 }
                 GraphOp::SelfAttention { channels, .. } => {
-                    let input = node.inputs.first()?;
+                    let Some(input) = node.inputs.first() else {
+                        return 0;
+                    };
                     let Some(shape) = shapes.get(input) else {
                         return 0;
                     };
@@ -323,7 +327,9 @@ impl GraphNetwork {
                     input_size,
                     hidden_size,
                 } => {
-                    let input = node.inputs.first()?;
+                    let Some(input) = node.inputs.first() else {
+                        return 0;
+                    };
                     let Some(shape) = shapes.get(input) else {
                         return 0;
                     };
