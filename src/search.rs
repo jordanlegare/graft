@@ -129,19 +129,23 @@ fn train_sample(
         let mut z = vec![0.0; layer.output];
         let mut y = vec![0.0; layer.output];
 
-        for o in 0..layer.output {
+        for (o, (z_value, y_value)) in
+            z.iter_mut().zip(y.iter_mut()).enumerate().take(layer.output)
+        {
             let mut sum = layer.bias[o];
 
-            for i in 0..layer.input {
+            for (i, current_value) in
+                current.iter().enumerate().take(layer.input)
+            {
                 let idx = layer.index(o, i);
 
                 if layer.active[idx] {
-                    sum += layer.weights[idx] * current[i];
+                    sum += layer.weights[idx] * *current_value;
                 }
             }
 
-            z[o] = sum;
-            y[o] = layer.activation.apply(sum);
+            *z_value = sum;
+            *y_value = layer.activation.apply(sum);
         }
 
         preactivations.push(z);
@@ -178,14 +182,18 @@ fn train_sample(
         let previous_delta = if layer_idx > 0 {
             let mut result = vec![0.0; input_size];
 
-            for i in 0..input_size {
+            for (i, result_value) in
+                result.iter_mut().enumerate().take(input_size)
+            {
                 let mut sum = 0.0;
 
-                for o in 0..output_size {
+                for (o, delta_value) in
+                    delta.iter().enumerate().take(output_size)
+                {
                     let idx = o * input_size + i;
 
                     if active_before[idx] {
-                        sum += weights_before[idx] * delta[o];
+                        sum += weights_before[idx] * *delta_value;
                     }
                 }
 
@@ -193,7 +201,7 @@ fn train_sample(
                 let previous_activation_fn =
                     network.layers[layer_idx - 1].activation;
 
-                result[i] =
+                *result_value =
                     sum * previous_activation_fn.derivative(previous_z);
             }
 
@@ -205,15 +213,19 @@ fn train_sample(
         {
             let layer = &mut network.layers[layer_idx];
 
-            for o in 0..output_size {
-                layer.bias[o] -= learning_rate * delta[o];
+            for (o, delta_value) in
+                delta.iter().enumerate().take(output_size)
+            {
+                layer.bias[o] -= learning_rate * *delta_value;
 
-                for i in 0..input_size {
+                for (i, previous_value) in
+                    previous_activation.iter().enumerate().take(input_size)
+                {
                     let idx = layer.index(o, i);
 
                     if layer.active[idx] {
                         layer.weights[idx] -=
-                            learning_rate * delta[o] * previous_activation[i];
+                            learning_rate * *delta_value * *previous_value;
                     }
                 }
             }
