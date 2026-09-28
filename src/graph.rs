@@ -2808,6 +2808,8 @@ fn random_activation<R: Rng>(rng: &mut R) -> Activation {
 pub struct GraphSearchConfig {
     pub candidates: usize,
     pub mutations: usize,
+    pub epochs: usize,
+    pub learning_rate: f32,
     pub accuracy_tolerance: f32,
 }
 
@@ -2816,6 +2818,8 @@ impl Default for GraphSearchConfig {
         Self {
             candidates: 32,
             mutations: 4,
+            epochs: 5,
+            learning_rate: 0.01,
             accuracy_tolerance: 0.01,
         }
     }
@@ -2832,16 +2836,28 @@ pub struct GraphCandidate {
 
 pub fn search_graph<R: Rng>(
     baseline: &GraphNetwork,
+    train_inputs: &[Vec<f32>],
+    train_targets: &[Vec<f32>],
     validation_inputs: &[Vec<f32>],
     validation_targets: &[Vec<f32>],
     config: &GraphSearchConfig,
     rng: &mut R,
 ) -> anyhow::Result<Vec<(GraphCandidate, GraphNetwork)>> {
     anyhow::ensure!(
+        train_inputs.len() == train_targets.len(),
+        "training input/target counts differ"
+    );
+    anyhow::ensure!(
         validation_inputs.len() == validation_targets.len(),
         "validation input/target counts differ"
     );
     anyhow::ensure!(config.candidates > 0, "graph candidate count must be > 0");
+    anyhow::ensure!(config.epochs > 0, "graph training epochs must be > 0");
+    anyhow::ensure!(
+        config.learning_rate > 0.0
+            && config.learning_rate.is_finite(),
+        "graph learning_rate must be finite and > 0"
+    );
 
     let baseline_mse =
         graph_mse(baseline, validation_inputs, validation_targets)?;
@@ -2852,6 +2868,13 @@ pub fn search_graph<R: Rng>(
         let mut candidate = baseline.clone();
         let mutations =
             candidate.mutate(rng, config.mutations);
+
+        candidate.train(
+            train_inputs,
+            train_targets,
+            config.epochs,
+            config.learning_rate,
+        )?;
 
         let mse =
             graph_mse(&candidate, validation_inputs, validation_targets)?;
@@ -3137,9 +3160,13 @@ mod tests {
             &graph,
             &inputs,
             &targets,
+            &inputs,
+            &targets,
             &GraphSearchConfig {
                 candidates: 4,
                 mutations: 2,
+                epochs: 1,
+                learning_rate: 0.001,
                 accuracy_tolerance: 0.1,
             },
             &mut rng,
