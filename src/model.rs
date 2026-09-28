@@ -175,6 +175,49 @@ impl Network {
         self.layers.iter().map(DenseLayer::active_count).collect()
     }
 
+    pub fn forward_activations(
+        &self,
+        input: &[f32],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(!self.layers.is_empty(), "network contains no layers");
+        anyhow::ensure!(
+            input.len() == self.layers[0].input,
+            "input size {} != expected {}",
+            input.len(),
+            self.layers[0].input
+        );
+
+        let mut current = input.to_vec();
+        let mut activations = Vec::with_capacity(self.layers.len());
+
+        for layer in &self.layers {
+            let mut output = vec![0.0; layer.output];
+
+            for (o, output_value) in
+                output.iter_mut().enumerate().take(layer.output)
+            {
+                let mut sum = layer.bias[o];
+
+                for (i, input_value) in
+                    current.iter().enumerate().take(layer.input)
+                {
+                    let idx = layer.index(o, i);
+
+                    if layer.active[idx] {
+                        sum += layer.weights[idx] * *input_value;
+                    }
+                }
+
+                *output_value = layer.activation.apply(sum);
+            }
+
+            current = output.clone();
+            activations.push(output);
+        }
+
+        Ok(activations)
+    }
+
     pub fn forward(&self, input: &[f32]) -> anyhow::Result<Vec<f32>> {
         anyhow::ensure!(!self.layers.is_empty(), "network contains no layers");
         anyhow::ensure!(

@@ -11,9 +11,9 @@ Graft now has two complementary candidate-generation modes.
 ### Weight-guided grafting
 
 Guided candidates start from the supplied trained network instead of random
-initialization. The mutation engine uses the existing parameters to identify
-structurally useful and redundant neurons, then applies parameter-preserving
-changes followed by fine-tuning:
+initialization. The mutation engine uses the existing parameters plus representative
+validation behavior to identify structurally useful and redundant neurons,
+then applies parameter-preserving changes followed by fine-tuning:
 
 - low-utility neuron pruning
 - high-utility neuron splitting
@@ -21,11 +21,17 @@ changes followed by fine-tuning:
 - low-utility connection pruning
 - sparse connection rewiring
 
-Neuron utility is derived from the magnitude of incoming and outgoing
-parameters. Neuron similarity is computed from incoming/outgoing parameter
-signatures. Splits duplicate a useful neuron with a small perturbation and
-divide its downstream weights; merges average similar incoming parameters and
-sum their downstream contributions.
+Weight utility is combined with activation magnitude, activation variance,
+activation sparsity, activation correlation, and validation-ablation loss.
+For pruning, Graft temporarily removes a neuron or edge and measures the
+change in validation MSE. For merging, it requires highly correlated
+activation traces and checks the merged network's validation error before
+accepting the candidate. Splits favor behaviorally active neurons with
+substantial activation variance. Rewiring chooses a low-sensitivity source
+edge and tests candidate inactive destinations against the validation set.
+
+The expensive behavior probes are capped by configurable sample and candidate
+limits so the search remains usable on larger MLPs.
 
 Connections have an explicit active mask. This lets the search engine
 represent sparse topology instead of treating every zero weight as a dense
