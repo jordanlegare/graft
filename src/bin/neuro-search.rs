@@ -67,6 +67,18 @@ struct Args {
     #[arg(long, default_value_t = 0.85)]
     similarity_threshold: f32,
 
+    #[arg(long, default_value_t = 256)]
+    behavior_samples: usize,
+
+    #[arg(long, default_value_t = 16)]
+    behavior_candidates: usize,
+
+    #[arg(long, default_value_t = 0.90)]
+    behavior_correlation_threshold: f32,
+
+    #[arg(long, default_value_t = 0.01)]
+    behavior_merge_tolerance: f32,
+
     #[arg(long)]
     export_best_dir: Option<String>,
 
@@ -355,6 +367,22 @@ fn main() -> Result<()> {
         "similarity_threshold must be between 0 and 1"
     );
     anyhow::ensure!(
+        args.behavior_samples > 0,
+        "behavior_samples must be greater than zero"
+    );
+    anyhow::ensure!(
+        args.behavior_candidates > 0,
+        "behavior_candidates must be greater than zero"
+    );
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&args.behavior_correlation_threshold),
+        "behavior_correlation_threshold must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        args.behavior_merge_tolerance >= 0.0,
+        "behavior_merge_tolerance must be non-negative"
+    );
+    anyhow::ensure!(
         args.min_width >= 1,
         "min_width must be at least 1"
     );
@@ -435,6 +463,11 @@ fn main() -> Result<()> {
             min_width: args.min_width,
             max_width: args.max_width,
             similarity_threshold: args.similarity_threshold,
+            behavior_samples: args.behavior_samples,
+            behavior_candidates: args.behavior_candidates,
+            behavior_correlation_threshold:
+                args.behavior_correlation_threshold,
+            behavior_merge_tolerance: args.behavior_merge_tolerance,
         },
     };
 
