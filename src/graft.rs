@@ -205,30 +205,6 @@ fn eligible_edge_prune(layer: &DenseLayer, output: usize, input: usize) -> bool 
     row_degree > 1 && column_degree > 1
 }
 
-fn weakest_connection(network: &Network) -> Option<(usize, usize, usize)> {
-    let mut best: Option<(usize, usize, usize, f32)> = None;
-
-    for layer_idx in 0..network.layers.len() {
-        let layer = &network.layers[layer_idx];
-
-        for output in 0..layer.output {
-            for input in 0..layer.input {
-                if !eligible_edge_prune(layer, output, input) {
-                    continue;
-                }
-
-                let weight = layer.weights[layer.index(output, input)].abs();
-
-                if best.is_none_or(|candidate| weight < candidate.3) {
-                    best = Some((layer_idx, output, input, weight));
-                }
-            }
-        }
-    }
-
-    best.map(|(layer, output, input, _)| (layer, output, input))
-}
-
 fn remove_row(layer: &mut DenseLayer, row: usize) {
     let mut weights = Vec::with_capacity((layer.output - 1) * layer.input);
     let mut active = Vec::with_capacity((layer.output - 1) * layer.input);
