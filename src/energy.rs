@@ -39,7 +39,7 @@ pub fn estimate_energy(
     for layer in &network.layers {
         let batch = batch_size as f64;
         let macs = batch * layer.input as f64 * layer.output as f64;
-        let reads = batch * layer.weights.len() as f64;
+        let reads = batch * layer.active_count() as f64;
         let writes = batch * layer.output as f64;
         let activations = batch * layer.output as f64;
         let bias_reads = batch * layer.bias.len() as f64;
