@@ -133,7 +133,7 @@ impl GraphNetwork {
 
         anyhow::ensure!(
             self.nodes.iter().any(|node| {
-                matches!(node.op, GraphOp::Input { .. })
+                matches!(&node.op, GraphOp::Input { .. })
             }),
             "graph has no input node"
         );
@@ -252,8 +252,8 @@ impl GraphNetwork {
             .nodes
             .iter()
             .filter_map(|node| {
-                if let GraphOp::Input { shape } = node.op {
-                    Some((node.id, shape))
+                if let GraphOp::Input { shape } = &node.op {
+                    Some((node.id, *shape))
                 } else {
                     None
                 }
@@ -559,7 +559,6 @@ impl GraphNetwork {
 
         let mut candidate = self.clone();
         candidate.nodes.push(node);
-        candidate.output = id;
         candidate.validate()?;
         *self = candidate;
 
@@ -671,14 +670,18 @@ impl GraphNetwork {
                     .map(|candidate| candidate.id)
                     .collect::<Vec<_>>();
 
-                candidates
-                    .get(rng.random_range(0..candidates.len()))
-                    .copied()
-                    .map(|new_input| GraphMutation::RewireInput {
-                        node: node.id,
-                        slot: 0,
-                        new_input,
-                    })
+                if candidates.is_empty() {
+                    None
+                } else {
+                    candidates
+                        .get(rng.random_range(0..candidates.len()))
+                        .copied()
+                        .map(|new_input| GraphMutation::RewireInput {
+                            node: node.id,
+                            slot: 0,
+                            new_input,
+                        })
+                }
             }
             1 => {
                 let node = selectable[rng.random_range(0..selectable.len())];
@@ -742,6 +745,10 @@ impl GraphNetwork {
                     shapes[&node.id]
                 };
 
+                if shapes.get(&self.output).copied()? != shape {
+                    return None;
+                }
+
                 let peers = selectable
                     .iter()
                     .filter(|node| shapes[&node.id] == shape)
@@ -795,14 +802,18 @@ impl GraphNetwork {
                         .map(|candidate| candidate.id)
                         .collect::<Vec<_>>();
 
-                    candidates
-                        .get(rng.random_range(0..candidates.len()))
-                        .copied()
-                        .map(|new_input| GraphMutation::RewireInput {
-                            node: node.id,
-                            slot,
-                            new_input,
-                        })
+                    if candidates.is_empty() {
+                        None
+                    } else {
+                        candidates
+                            .get(rng.random_range(0..candidates.len()))
+                            .copied()
+                            .map(|new_input| GraphMutation::RewireInput {
+                                node: node.id,
+                                slot,
+                                new_input,
+                            })
+                    }
                 } else {
                     None
                 }
@@ -1163,8 +1174,12 @@ fn infer_node_shape(
         } => {
             anyhow::ensure!(input_shapes.len() == 1, "conv needs one input");
             let input = input_shapes[0];
+            anyhow::ensure!(
+                input.length >= *kernel,
+                "conv kernel exceeds sequence length"
+            );
             let length =
-                (input.length - kernel + *stride).div_ceil(*stride);
+                (input.length - *kernel + *stride).div_ceil(*stride);
             TensorShape::sequence(*output_channels, length)
         }
         GraphOp::SelfAttention { channels, .. } => {
