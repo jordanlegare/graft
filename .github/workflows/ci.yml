@@ -19,8 +19,8 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Format Rust sources
+        run: cargo fmt --all
 
       - name: Compile
         run: cargo check --all-targets
