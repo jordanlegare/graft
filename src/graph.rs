@@ -626,11 +626,7 @@ impl GraphNetwork {
     fn forward_training(
         &self,
         input: &[f32],
-    ) -> anyhow::Result<(
-        Vec<usize>,
-        std::collections::HashMap<usize, Vec<f32>>,
-        std::collections::HashMap<usize, TrainingCache>,
-    )> {
+    ) -> anyhow::Result<TrainingForward> {
         self.validate()?;
         let expected = self.input_shape()?;
 
@@ -644,10 +640,8 @@ impl GraphNetwork {
         let by_id = self.node_map();
         let order = self.topological_order()?;
         let shapes = self.infer_shapes()?;
-        let mut values =
-            std::collections::HashMap::<usize, Vec<f32>>::new();
-        let mut caches =
-            std::collections::HashMap::<usize, TrainingCache>::new();
+        let mut values = ValueMap::new();
+        let mut caches = CacheMap::new();
 
         for id in &order {
             let node = by_id.get(id).expect("node from order");
@@ -712,7 +706,7 @@ impl GraphNetwork {
                 }
                 GraphOp::SelfAttention { channels, heads } => {
                     let x = single_input(&values, node)?.to_vec();
-                    let (y, q, k, v, probabilities) =
+                    let attention =
                         self_attention_training_forward(
                             &x,
                             *channels,
@@ -721,15 +715,15 @@ impl GraphNetwork {
                             &node.bias,
                         )?;
 
-                    values.insert(*id, y);
+                    values.insert(*id, attention.output);
                     caches.insert(
                         *id,
                         TrainingCache::SelfAttention {
-                            input: x.to_vec(),
-                            q,
-                            k,
-                            v,
-                            probabilities,
+                            input: x,
+                            q: attention.q,
+                            k: attention.k,
+                            v: attention.v,
+                            probabilities: attention.probabilities,
                         },
                     );
                 }
@@ -1215,6 +1209,19 @@ impl GraphNetwork {
 }
 
 
+type ValueMap = std::collections::HashMap<usize, Vec<f32>>;
+type CacheMap = std::collections::HashMap<usize, TrainingCache>;
+type TrainingForward = (Vec<usize>, ValueMap, CacheMap);
+
+#[derive(Debug, Clone)]
+struct AttentionForward {
+    output: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    probabilities: Vec<f32>,
+}
+
 #[derive(Debug, Clone)]
 enum TrainingCache {
     Input,
@@ -1528,10 +1535,9 @@ fn backward_node(
                             * (1.0 - state_value * state_value);
                 }
 
-                for hidden in 0..*hidden_size {
-                    let gradient_value =
-                        gradient_pre[hidden];
-
+                for (hidden, gradient_value) in
+                    gradient_pre.iter().copied().enumerate()
+                {
                     for input_index in 0..*input_size {
                         gradient_input[
                             input_index * length
@@ -1546,8 +1552,10 @@ fn backward_node(
                         input_weight_count
                             + hidden * *hidden_size;
 
-                    for previous in 0..*hidden_size {
-                        gradient_state[previous] +=
+                    for (previous, state_gradient) in
+                        gradient_state.iter_mut().enumerate()
+                    {
+                        *state_gradient +=
                             node.weights[
                                 recurrent_base + previous
                             ] * gradient_value;
@@ -1994,13 +2002,7 @@ fn self_attention_training_forward(
     heads: usize,
     weights: &[f32],
     bias: &[f32],
-) -> anyhow::Result<(
-    Vec<f32>,
-    Vec<f32>,
-    Vec<f32>,
-    Vec<f32>,
-    Vec<f32>,
-)> {
+) -> anyhow::Result<AttentionForward> {
     let length = x.len() / channels;
     let head_dim = channels / heads;
     let mut q = vec![0.0; channels * length];
@@ -2133,13 +2135,13 @@ fn self_attention_training_forward(
         }
     }
 
-    Ok((
-        y,
+    Ok(AttentionForward {
+        output: y,
         q,
         k,
         v,
         probabilities,
-    ))
+    })
 }
 
 fn recurrent_training_forward(
