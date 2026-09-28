@@ -1,6 +1,9 @@
 use crate::{
     data::Dataset,
     energy::{estimate_energy, HardwareProfile},
+    graft::{
+        apply_guided_mutations, mutation_strings, GuidedMutationConfig,
+    },
     model::{Activation, Network},
 };
 use rand::Rng;
@@ -18,18 +21,34 @@ pub struct SearchConfig {
     pub min_depth: usize,
     pub max_depth: usize,
     pub hidden_activations: Vec<Activation>,
+
+    // Fraction of candidates seeded from the supplied trained network.
+    pub guided_fraction: f32,
+    // Number of parameter-guided mutations applied to a guided candidate.
+    pub guided_mutations: usize,
+    pub guided_config: GuidedMutationConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateResult {
     pub id: usize,
+    pub origin: String,
     pub topology: Vec<usize>,
     pub hidden_activation: String,
+    pub mutations: Vec<String>,
     pub parameters: usize,
+    pub dense_parameters: usize,
+    pub active_connections: usize,
     pub macs: u64,
     pub mse: f32,
     pub energy_pj: f64,
     pub accuracy_accepted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchCandidate {
+    pub result: CandidateResult,
+    pub network: Network,
 }
 
 pub fn mse(network: &Network, dataset: &Dataset) -> f32 {
@@ -110,15 +129,23 @@ fn train_sample(
         let mut z = vec![0.0; layer.output];
         let mut y = vec![0.0; layer.output];
 
-        for o in 0..layer.output {
+        for (o, (z_value, y_value)) in
+            z.iter_mut().zip(y.iter_mut()).enumerate().take(layer.output)
+        {
             let mut sum = layer.bias[o];
 
-            for i in 0..layer.input {
-                sum += layer.weights[o * layer.input + i] * current[i];
+            for (i, current_value) in
+                current.iter().enumerate().take(layer.input)
+            {
+                let idx = layer.index(o, i);
+
+                if layer.active[idx] {
+                    sum += layer.weights[idx] * *current_value;
+                }
             }
 
-            z[o] = sum;
-            y[o] = layer.activation.apply(sum);
+            *z_value = sum;
+            *y_value = layer.activation.apply(sum);
         }
 
         preactivations.push(z);
@@ -127,6 +154,7 @@ fn train_sample(
     }
 
     let last = network.layers.len() - 1;
+
     if activations[last + 1].len() != target.len() {
         return;
     }
@@ -136,34 +164,44 @@ fn train_sample(
     for j in 0..delta.len() {
         let output = activations[last + 1][j];
         let error = output - target[j];
+
         delta[j] =
-            error * network.layers[last]
-                .activation
-                .derivative(preactivations[last][j]);
+            error
+                * network.layers[last]
+                    .activation
+                    .derivative(preactivations[last][j]);
     }
 
     for layer_idx in (0..network.layers.len()).rev() {
         let input_size = network.layers[layer_idx].input;
         let output_size = network.layers[layer_idx].output;
-        let activation = network.layers[layer_idx].activation;
         let weights_before = network.layers[layer_idx].weights.clone();
+        let active_before = network.layers[layer_idx].active.clone();
         let previous_activation = activations[layer_idx].clone();
 
         let previous_delta = if layer_idx > 0 {
             let mut result = vec![0.0; input_size];
 
-            for i in 0..input_size {
+            for (i, result_value) in
+                result.iter_mut().enumerate().take(input_size)
+            {
                 let mut sum = 0.0;
 
-                for o in 0..output_size {
-                    sum += weights_before[o * input_size + i] * delta[o];
+                for (o, delta_value) in
+                    delta.iter().enumerate().take(output_size)
+                {
+                    let idx = o * input_size + i;
+
+                    if active_before[idx] {
+                        sum += weights_before[idx] * *delta_value;
+                    }
                 }
 
                 let previous_z = preactivations[layer_idx - 1][i];
                 let previous_activation_fn =
                     network.layers[layer_idx - 1].activation;
 
-                result[i] =
+                *result_value =
                     sum * previous_activation_fn.derivative(previous_z);
             }
 
@@ -175,21 +213,25 @@ fn train_sample(
         {
             let layer = &mut network.layers[layer_idx];
 
-            for o in 0..output_size {
-                layer.bias[o] -= learning_rate * delta[o];
+            for (o, delta_value) in
+                delta.iter().enumerate().take(output_size)
+            {
+                layer.bias[o] -= learning_rate * *delta_value;
 
-                for i in 0..input_size {
-                    let index = o * input_size + i;
+                for (i, previous_value) in
+                    previous_activation.iter().enumerate().take(input_size)
+                {
+                    let idx = layer.index(o, i);
 
-                    layer.weights[index] -=
-                        learning_rate * delta[o] * previous_activation[i];
+                    if layer.active[idx] {
+                        layer.weights[idx] -=
+                            learning_rate * *delta_value * *previous_value;
+                    }
                 }
             }
         }
 
         delta = previous_delta.unwrap_or_default();
-
-        let _ = activation;
     }
 }
 
@@ -198,28 +240,68 @@ pub fn search(
     cfg: &SearchConfig,
     hardware: &HardwareProfile,
     baseline: &Network,
-) -> Vec<CandidateResult> {
+) -> Vec<SearchCandidate> {
     let baseline_error = mse(baseline, dataset);
     let mut rng = rand::rng();
     let mut results = Vec::with_capacity(cfg.candidates);
 
     for id in 0..cfg.candidates {
-        let topology = generate_topology(
-            baseline.layers[0].input,
-            baseline.layers.last().expect("non-empty baseline").output,
-            cfg,
-            &mut rng,
-        );
+        let use_guided =
+            rng.random::<f32>() < cfg.guided_fraction;
 
-        let activation = cfg.hidden_activations[
-            rng.random_range(0..cfg.hidden_activations.len())
-        ];
+        let (mut candidate, origin, activation_name, mutation_history) =
+            if use_guided {
+                let mut candidate = baseline.clone();
 
-        let Ok(mut candidate) =
-            crate::model::random_network(&topology, activation, &mut rng)
-        else {
-            continue;
-        };
+                let mutation_count = if cfg.guided_mutations == 0 {
+                    0
+                } else {
+                    rng.random_range(1..=cfg.guided_mutations)
+                };
+
+                let history = apply_guided_mutations(
+                    &mut candidate,
+                    &cfg.guided_config,
+                    mutation_count,
+                    &mut rng,
+                );
+
+                (
+                    candidate,
+                    "guided",
+                    "baseline-activation".to_owned(),
+                    mutation_strings(&history),
+                )
+            } else {
+                let topology = generate_topology(
+                    baseline.layers[0].input,
+                    baseline.layers.last()
+                        .expect("non-empty baseline")
+                        .output,
+                    cfg,
+                    &mut rng,
+                );
+
+                let activation =
+                    cfg.hidden_activations[
+                        rng.random_range(0..cfg.hidden_activations.len())
+                    ];
+
+                let candidate =
+                    crate::model::random_network(
+                        &topology,
+                        activation,
+                        &mut rng,
+                    )
+                    .expect("generated topology must be valid");
+
+                (
+                    candidate,
+                    "random",
+                    format!("{activation:?}"),
+                    Vec::new(),
+                )
+            };
 
         train(
             &mut candidate,
@@ -232,26 +314,39 @@ pub fn search(
         let energy =
             estimate_energy(&candidate, hardware, cfg.batch_size);
 
-        results.push(CandidateResult {
+        let result = CandidateResult {
             id,
-            topology,
-            hidden_activation: format!("{activation:?}"),
+            origin: origin.to_owned(),
+            topology: candidate.topology(),
+            hidden_activation: activation_name,
+            mutations: mutation_history,
             parameters: candidate.parameter_count(),
+            dense_parameters: candidate.dense_parameter_count(),
+            active_connections: candidate.active_connection_count(),
             macs: candidate.mac_count(),
             mse: candidate_mse,
             energy_pj: energy,
             accuracy_accepted:
                 candidate_mse <= baseline_error + cfg.accuracy_tolerance,
+        };
+
+        results.push(SearchCandidate {
+            result,
+            network: candidate,
         });
     }
 
     results.sort_by(|a, b| {
-        match (a.accuracy_accepted, b.accuracy_accepted) {
+        match (
+            a.result.accuracy_accepted,
+            b.result.accuracy_accepted,
+        ) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
             _ => a
+                .result
                 .energy_pj
-                .partial_cmp(&b.energy_pj)
+                .partial_cmp(&b.result.energy_pj)
                 .unwrap_or(std::cmp::Ordering::Equal),
         }
     });

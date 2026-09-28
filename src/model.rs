@@ -42,7 +42,13 @@ impl Activation {
     pub fn derivative(self, x: f32) -> f32 {
         match self {
             Self::Linear => 1.0,
-            Self::Relu => if x > 0.0 { 1.0 } else { 0.0 },
+            Self::Relu => {
+                if x > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             Self::Tanh => {
                 let t = x.tanh();
                 1.0 - t * t
@@ -58,6 +64,72 @@ pub struct DenseLayer {
     pub weights: Vec<f32>,
     pub bias: Vec<f32>,
     pub activation: Activation,
+
+    // Explicit connection support. A false entry represents a pruned edge.
+    // Inactive weights are set to zero and exported together with the mask.
+    pub active: Vec<bool>,
+}
+
+impl DenseLayer {
+    pub fn new(
+        input: usize,
+        output: usize,
+        weights: Vec<f32>,
+        bias: Vec<f32>,
+        activation: Activation,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            weights.len() == input * output,
+            "weight count {} != {}x{}",
+            weights.len(),
+            input,
+            output
+        );
+        anyhow::ensure!(
+            bias.len() == output,
+            "bias count {} != output {}",
+            bias.len(),
+            output
+        );
+
+        Ok(Self {
+            input,
+            output,
+            active: vec![true; input * output],
+            weights,
+            bias,
+            activation,
+        })
+    }
+
+    #[inline]
+    pub fn index(&self, output: usize, input: usize) -> usize {
+        output * self.input + input
+    }
+
+    #[inline]
+    pub fn is_active(&self, output: usize, input: usize) -> bool {
+        self.active[self.index(output, input)]
+    }
+
+    #[inline]
+    pub fn set_active(
+        &mut self,
+        output: usize,
+        input: usize,
+        active: bool,
+    ) {
+        let idx = self.index(output, input);
+        self.active[idx] = active;
+
+        if !active {
+            self.weights[idx] = 0.0;
+        }
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active.iter().filter(|x| **x).count()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,11 +139,25 @@ pub struct Network {
 
 impl Network {
     pub fn parameter_count(&self) -> usize {
-        self.layers.iter().map(|l| l.weights.len() + l.bias.len()).sum()
+        self.layers
+            .iter()
+            .map(|l| l.active_count() + l.bias.len())
+            .sum()
+    }
+
+    pub fn dense_parameter_count(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| l.weights.len() + l.bias.len())
+            .sum()
+    }
+
+    pub fn active_connection_count(&self) -> usize {
+        self.layers.iter().map(DenseLayer::active_count).sum()
     }
 
     pub fn mac_count(&self) -> u64 {
-        self.layers.iter().map(|l| (l.input * l.output) as u64).sum()
+        self.active_connection_count() as u64
     }
 
     pub fn topology(&self) -> Vec<usize> {
@@ -83,6 +169,10 @@ impl Network {
         shape.push(self.layers[0].input);
         shape.extend(self.layers.iter().map(|l| l.output));
         shape
+    }
+
+    pub fn active_edges_per_layer(&self) -> Vec<usize> {
+        self.layers.iter().map(DenseLayer::active_count).collect()
     }
 
     pub fn forward(&self, input: &[f32]) -> anyhow::Result<Vec<f32>> {
@@ -99,14 +189,18 @@ impl Network {
         for layer in &self.layers {
             let mut y = vec![0.0; layer.output];
 
-            for o in 0..layer.output {
+            for (o, y_value) in y.iter_mut().enumerate().take(layer.output) {
                 let mut sum = layer.bias[o];
 
-                for i in 0..layer.input {
-                    sum += layer.weights[o * layer.input + i] * x[i];
+                for (i, x_value) in x.iter().enumerate().take(layer.input) {
+                    let idx = o * layer.input + i;
+
+                    if layer.active[idx] {
+                        sum += layer.weights[idx] * *x_value;
+                    }
                 }
 
-                y[o] = layer.activation.apply(sum);
+                *y_value = layer.activation.apply(sum);
             }
 
             x = y;
@@ -147,6 +241,7 @@ pub fn random_network(
             weights,
             bias: vec![0.0; output],
             activation,
+            active: vec![true; input * output],
         });
     }
 

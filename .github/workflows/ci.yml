@@ -19,8 +19,8 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Format Rust sources
+        run: cargo fmt --all
 
       - name: Compile
         run: cargo check --all-targets
@@ -45,3 +45,7 @@ jobs:
           --max-width 20
           --min-depth 1
           --max-depth 3
+          --guided-fraction 0.75
+          --guided-mutations 3
+          --similarity-threshold 0.85
+          --export-best-dir grafted

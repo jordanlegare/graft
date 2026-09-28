@@ -4,39 +4,55 @@ Graft is a Rust prototype for discovering lower-compute dense neural-network
 topologies from an existing model's weights, biases, tensor shapes, activation
 metadata, and representative input/target samples.
 
-## Current engine
+## Search modes
 
-The prototype:
+Graft now has two complementary candidate-generation modes.
 
-1. Loads raw little-endian f32 weight and bias files.
-2. Reconstructs the supplied baseline MLP from a JSON manifest.
-3. Generates alternative dense topologies.
-4. Searches hidden activation choices.
-5. Fine-tunes each candidate on representative samples.
-6. Computes validation MSE.
-7. Estimates energy from MACs, memory traffic, and activation work.
-8. Ranks candidates that satisfy the supplied MSE tolerance.
+### Weight-guided grafting
 
-The energy value is an analytical estimate, not measured electrical energy.
-Hardware benchmarking should replace the analytical profile before making a
-physical energy-efficiency claim.
+Guided candidates start from the supplied trained network instead of random
+initialization. The mutation engine uses the existing parameters to identify
+structurally useful and redundant neurons, then applies parameter-preserving
+changes followed by fine-tuning:
+
+- low-utility neuron pruning
+- high-utility neuron splitting
+- similar-neuron merging
+- low-utility connection pruning
+- sparse connection rewiring
+
+Neuron utility is derived from the magnitude of incoming and outgoing
+parameters. Neuron similarity is computed from incoming/outgoing parameter
+signatures. Splits duplicate a useful neuron with a small perturbation and
+divide its downstream weights; merges average similar incoming parameters and
+sum their downstream contributions.
+
+Connections have an explicit active mask. This lets the search engine
+represent sparse topology instead of treating every zero weight as a dense
+connection.
+
+### Random architecture search
+
+A configurable fraction of candidates can still be generated from scratch over
+random depth, width, and activation choices. This gives the optimizer a way to
+explore architectures outside the local neighborhood of the supplied network.
 
 ## Build
 
-```text
+~~~
 cargo build --release
 cargo test
-```
+~~~
 
 ## Generate the ONNX test model
 
-```text
+~~~
 cargo run --release --bin onnx-seed
-```
+~~~
 
 This generates an 8 -> 16 -> 4 MLP:
 
-```text
+~~~
 seed/
   model.onnx
   manifest.json
@@ -45,48 +61,67 @@ seed/
   b0.bin
   W1.bin
   b1.bin
-```
+~~~
 
-## Search
+## Weight-guided search
 
-```text
-cargo run --release --bin neuro-search -- \
-  --manifest seed/manifest.json \
-  --dataset seed/dataset.json \
-  --candidates 100 \
-  --epochs 25 \
-  --learning-rate 0.01 \
-  --accuracy-tolerance 0.01 \
-  --min-width 4 \
-  --max-width 64 \
-  --min-depth 1 \
-  --max-depth 4 \
-  --activation-candidates relu,tanh \
-  --output results.json
-```
+~~~
+cargo run --release --bin neuro-search --   --manifest seed/manifest.json   --dataset seed/dataset.json   --candidates 100   --epochs 25   --learning-rate 0.01   --accuracy-tolerance 0.01   --min-width 4   --max-width 64   --min-depth 1   --max-depth 4   --guided-fraction 0.75   --guided-mutations 3   --similarity-threshold 0.85   --activation-candidates relu,tanh   --export-best-dir grafted   --output results.json
+~~~
+
+The default guided-fraction=0.75 means roughly three quarters of the
+candidates start from the supplied trained parameters. Set it to 1.0 for
+fully guided local topology search, or 0.0 for the original random-search
+behavior.
+
+## Exported graft
+
+When --export-best-dir is supplied, the selected candidate produces:
+
+~~~
+grafted/
+  manifest.json
+  topology.json
+  W0.bin
+  b0.bin
+  mask0.bin
+  W1.bin
+  b1.bin
+  mask1.bin
+  ...
+~~~
+
+maskN.bin contains one byte per stored weight: 1 means the connection is
+active and 0 means it is pruned. This makes the discovered sparse topology
+portable to a later sparse compiler/runtime stage.
 
 ## Optional hardware profile
 
-```json
+~~~json
 {
   "mac_energy_pj": 1.0,
   "memory_read_energy_pj": 2.0,
   "memory_write_energy_pj": 2.5,
   "activation_energy_pj": 0.2
 }
-```
+~~~
 
 Run with:
 
-```text
+~~~
 --hardware hardware.json
-```
+~~~
+
+The model uses the number of active connections when estimating MAC and weight
+read energy. It is still an analytical estimate; electrical measurements on
+the target device are required for a physical energy claim.
 
 ## Manifest
 
-The manifest supplies tensor shapes, paths, and activation metadata:
+The manifest supplies tensor shapes, paths, activation metadata, and optional
+sparse masks:
 
-```json
+~~~json
 {
   "input_size": 8,
   "output_size": 4,
@@ -107,19 +142,20 @@ The manifest supplies tensor shapes, paths, and activation metadata:
     }
   ]
 }
-```
+~~~
 
-Raw weight and bias files are little-endian f32. For the search engine, weight
-matrices are stored row-major as [output, input].
+Exported manifests add active_mask per layer.
+
+Raw weight and bias files are little-endian f32. Weight matrices are stored
+row-major as [output, input].
 
 ## Scope
 
-This first implementation searches feed-forward dense MLPs. It does not yet
-infer convolutional, attention, recurrent, residual, or arbitrary DAG graphs.
+This stage searches feed-forward dense MLPs. Convolutional, attention,
+recurrent, residual, and arbitrary DAG graph transformations are not yet
+implemented.
 
-The next graft stage should use the trained parameters themselves to drive
-topology mutation: neuron pruning, neuron merging, neuron splitting, connection
-rewiring, and parameter transplantation instead of random reinitialization.
+The intended next stage is hardware-aware compilation of the exported masks
+and sparse weights, followed by real-device energy measurement.
 
-CI verification for the repository build and seed/search smoke test is defined
-in .github/workflows/ci.yml.
+CI formats the workspace before compile and test.
