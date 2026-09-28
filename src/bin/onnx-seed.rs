@@ -154,7 +154,7 @@ fn main() -> Result<()> {
             .map(|_| rng.random_range(-1.0..1.0))
             .collect();
 
-        let mut hidden = vec![0.0; HIDDEN];
+        let mut hidden = [0.0; HIDDEN];
 
         for h in 0..HIDDEN {
             let mut sum = b0[h];
