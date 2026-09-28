@@ -78,6 +78,42 @@ impl Default for GuidedMutationConfig {
     }
 }
 
+fn hidden_layer_indices(network: &Network) -> impl Iterator<Item = usize> {
+    0..network.layers.len().saturating_sub(1)
+}
+
+fn neuron_utility(
+    network: &Network,
+    layer_idx: usize,
+    neuron: usize,
+) -> f32 {
+    let layer = &network.layers[layer_idx];
+
+    let incoming = (0..layer.input)
+        .filter_map(|input| {
+            let idx = neuron * layer.input + input;
+            layer.active[idx].then_some(layer.weights[idx].abs())
+        })
+        .sum::<f32>();
+
+    let bias = layer.bias[neuron].abs();
+
+    let outgoing = if layer_idx + 1 < network.layers.len() {
+        let next = &network.layers[layer_idx + 1];
+
+        (0..next.output)
+            .filter_map(|output| {
+                let idx = output * next.input + neuron;
+                next.active[idx].then_some(next.weights[idx].abs())
+            })
+            .sum::<f32>()
+    } else {
+        0.0
+    };
+
+    (incoming + bias + 1e-6) * (outgoing + 1e-6)
+}
+
 pub fn neuron_utilities(network: &Network) -> Vec<Vec<f32>> {
     hidden_layer_indices(network)
         .map(|layer_idx| {
@@ -879,16 +915,11 @@ fn behavior_merge_pair(
 
         if delta <= config.behavior_merge_tolerance
             && best.is_none_or(
-                |current: (usize, usize, usize, f32, f32, f32)| {
+                |current: (usize, usize, usize, f32, f32)| {
                     correlation > current.3
                         || (
                             correlation == current.3
                                 && parameter_similarity > current.4
-                        )
-                        || (
-                            correlation == current.3
-                                && parameter_similarity == current.4
-                                && delta < current.5
                         )
                 },
             )
@@ -899,12 +930,11 @@ fn behavior_merge_pair(
                 second,
                 correlation,
                 parameter_similarity,
-                delta,
             ));
         }
     }
 
-    best.map(|(layer, first, second, correlation, _, _)| {
+    best.map(|(layer, first, second, correlation, _)| {
         (layer, first, second, correlation)
     })
 }
