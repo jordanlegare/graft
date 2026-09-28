@@ -63,14 +63,16 @@ search path for architectures that are not representable as a simple MLP:
 
 The graph runtime performs shape inference and cycle detection before every
 candidate is evaluated. Graph mutations preserve tensor compatibility and the
-final output shape, so DAG search remains compatible with supervised MSE
-selection and the train/validation/holdout protocol.
+final output shape. Every mutated graph is then fine-tuned by reverse-mode
+gradient descent on the training split before validation scoring; recurrent
+nodes use backpropagation through time and attention nodes backpropagate
+through Q/K/V projections and the softmax attention weights.
 
 Generate the multi-operator graph seed and run the graph search with:
 
 ~~~
 cargo run --release --bin graph-seed
-cargo run --release --bin graph-search -- --graph seed/graph.json --dataset seed/graph-dataset.json --candidates 32 --mutations 4 --validation-fraction 0.15 --holdout-fraction 0.15 --split-seed 42 --export-best seed/grafted-graph.json
+cargo run --release --bin graph-search -- --graph seed/graph.json --dataset seed/graph-dataset.json --candidates 32 --mutations 4 --epochs 5 --learning-rate 0.01 --validation-fraction 0.15 --holdout-fraction 0.15 --split-seed 42 --export-best seed/grafted-graph.json
 ~~~
 
 `graph.json` is the serialized `GraphNetwork` IR, so graph architectures can be
