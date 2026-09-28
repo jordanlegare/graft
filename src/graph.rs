@@ -480,6 +480,333 @@ impl GraphNetwork {
             .ok_or_else(|| anyhow::anyhow!("graph produced no output"))
     }
 
+
+    pub fn train(
+        &mut self,
+        inputs: &[Vec<f32>],
+        targets: &[Vec<f32>],
+        epochs: usize,
+        learning_rate: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            inputs.len() == targets.len(),
+            "training input/target counts differ"
+        );
+        anyhow::ensure!(!inputs.is_empty(), "training dataset is empty");
+        anyhow::ensure!(epochs > 0, "training epochs must be > 0");
+        anyhow::ensure!(
+            learning_rate > 0.0 && learning_rate.is_finite(),
+            "learning_rate must be finite and > 0"
+        );
+
+        self.validate()?;
+
+        for _ in 0..epochs {
+            for (input, target) in inputs.iter().zip(targets) {
+                self.train_sample(input, target, learning_rate)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn train_sample(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        learning_rate: f32,
+    ) -> anyhow::Result<()> {
+        let (order, values, caches) =
+            self.forward_training(input)?;
+        let output = values
+            .get(&self.output)
+            .ok_or_else(|| anyhow::anyhow!("training graph produced no output"))?;
+
+        anyhow::ensure!(
+            output.len() == target.len(),
+            "graph output width {} != target width {}",
+            output.len(),
+            target.len()
+        );
+
+        let mut gradients = values
+            .iter()
+            .map(|(id, value)| (*id, vec![0.0; value.len()]))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let output_gradient = gradients
+            .get_mut(&self.output)
+            .expect("output gradient initialized");
+
+        for ((gradient, prediction), expected) in
+            output_gradient.iter_mut().zip(output).zip(target)
+        {
+            *gradient = *prediction - *expected;
+        }
+
+        let index_by_id = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id, index))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for id in order.into_iter().rev() {
+            let gradient_output = gradients
+                .remove(&id)
+                .expect("gradient initialized for node");
+            let node_index =
+                *index_by_id.get(&id).expect("node id indexed");
+
+            let node = &self.nodes[node_index];
+            let cache =
+                caches.get(&id).expect("cache initialized for node");
+
+            let input_gradients =
+                backward_node(node, cache, &gradient_output)?;
+
+            for (input_id, gradient_input) in input_gradients {
+                let entry = gradients
+                    .get_mut(&input_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "missing gradient buffer for node {}",
+                            input_id
+                        )
+                    })?;
+
+                anyhow::ensure!(
+                    entry.len() == gradient_input.len(),
+                    "gradient shape mismatch for node {}",
+                    input_id
+                );
+
+                for (dst, src) in
+                    entry.iter_mut().zip(gradient_input.iter())
+                {
+                    *dst += *src;
+                }
+            }
+
+            let parameter_gradient =
+                parameter_gradients(node, cache, &gradient_output)?;
+
+            let node_mut =
+                &mut self.nodes[node_index];
+
+            anyhow::ensure!(
+                node_mut.weights.len()
+                    == parameter_gradient.0.len(),
+                "weight gradient shape mismatch for node {}",
+                id
+            );
+            anyhow::ensure!(
+                node_mut.bias.len()
+                    == parameter_gradient.1.len(),
+                "bias gradient shape mismatch for node {}",
+                id
+            );
+
+            for (weight, gradient) in
+                node_mut.weights.iter_mut().zip(parameter_gradient.0)
+            {
+                *weight -= learning_rate * gradient;
+            }
+
+            for (bias, gradient) in
+                node_mut.bias.iter_mut().zip(parameter_gradient.1)
+            {
+                *bias -= learning_rate * gradient;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn forward_training(
+        &self,
+        input: &[f32],
+    ) -> anyhow::Result<(
+        Vec<usize>,
+        std::collections::HashMap<usize, Vec<f32>>,
+        std::collections::HashMap<usize, TrainingCache>,
+    )> {
+        self.validate()?;
+        let expected = self.input_shape()?;
+
+        anyhow::ensure!(
+            input.len() == expected.size(),
+            "input size {} != expected {}",
+            input.len(),
+            expected.size()
+        );
+
+        let by_id = self.node_map();
+        let order = self.topological_order()?;
+        let shapes = self.infer_shapes()?;
+        let mut values =
+            std::collections::HashMap::<usize, Vec<f32>>::new();
+        let mut caches =
+            std::collections::HashMap::<usize, TrainingCache>::new();
+
+        for id in &order {
+            let node = by_id.get(id).expect("node from order");
+            let node_shape = shapes[id];
+
+            match &node.op {
+                GraphOp::Input { .. } => {
+                    values.insert(*id, input.to_vec());
+                    caches.insert(*id, TrainingCache::Input);
+                }
+                GraphOp::Dense { input: width, output } => {
+                    let x = single_input(&values, node)?;
+                    let mut y = vec![0.0; *output];
+
+                    for (o, y_value) in
+                        y.iter_mut().enumerate().take(*output)
+                    {
+                        let mut sum = node.bias[o];
+
+                        for (i, x_value) in
+                            x.iter().enumerate().take(*width)
+                        {
+                            sum +=
+                                node.weights[o * *width + i] * *x_value;
+                        }
+
+                        *y_value = sum;
+                    }
+
+                    values.insert(*id, y);
+                    caches.insert(
+                        *id,
+                        TrainingCache::Dense {
+                            input: x.to_vec(),
+                        },
+                    );
+                }
+                GraphOp::Conv1d {
+                    input_channels,
+                    output_channels,
+                    kernel,
+                    stride,
+                } => {
+                    let x = single_input(&values, node)?;
+                    let y = conv1d(
+                        x,
+                        *input_channels,
+                        *output_channels,
+                        *kernel,
+                        *stride,
+                        &node.weights,
+                        &node.bias,
+                    )?;
+
+                    values.insert(*id, y);
+                    caches.insert(
+                        *id,
+                        TrainingCache::Conv1d {
+                            input: x.to_vec(),
+                        },
+                    );
+                }
+                GraphOp::SelfAttention { channels, heads } => {
+                    let x = single_input(&values, node)?;
+                    let (y, q, k, v, probabilities) =
+                        self_attention_training_forward(
+                            x,
+                            *channels,
+                            *heads,
+                            &node.weights,
+                            &node.bias,
+                        )?;
+
+                    values.insert(*id, y);
+                    caches.insert(
+                        *id,
+                        TrainingCache::SelfAttention {
+                            input: x.to_vec(),
+                            q,
+                            k,
+                            v,
+                            probabilities,
+                        },
+                    );
+                }
+                GraphOp::Recurrent {
+                    input_size,
+                    hidden_size,
+                } => {
+                    let x = single_input(&values, node)?;
+                    let (y, states) =
+                        recurrent_training_forward(
+                            x,
+                            *input_size,
+                            *hidden_size,
+                            &node.weights,
+                            &node.bias,
+                        )?;
+
+                    values.insert(*id, y);
+                    caches.insert(
+                        *id,
+                        TrainingCache::Recurrent {
+                            input: x.to_vec(),
+                            states,
+                        },
+                    );
+                }
+                GraphOp::Add => {
+                    let mut y =
+                        vec![0.0; node_shape.size()];
+
+                    for source in &node.inputs {
+                        let value =
+                            values.get(source).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing value for node {} input {}",
+                                    node.id,
+                                    source
+                                )
+                            })?;
+
+                        anyhow::ensure!(
+                            value.len() == y.len(),
+                            "add node {} input shape mismatch",
+                            node.id
+                        );
+
+                        for (dst, src) in
+                            y.iter_mut().zip(value.iter())
+                        {
+                            *dst += *src;
+                        }
+                    }
+
+                    values.insert(*id, y);
+                    caches.insert(*id, TrainingCache::Add);
+                }
+                GraphOp::Activation { activation } => {
+                    let x = single_input(&values, node)?;
+                    let y = x
+                        .iter()
+                        .map(|value| activation.apply(*value))
+                        .collect::<Vec<_>>();
+
+                    values.insert(*id, y);
+                    caches.insert(
+                        *id,
+                        TrainingCache::Activation {
+                            input: x.to_vec(),
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok((order, values, caches))
+    }
+
     pub fn replace_op(
         &mut self,
         node_id: usize,
