@@ -223,42 +223,6 @@ fn train_sample(
     }
 }
 
-fn result_for(
-    id: usize,
-    origin: &str,
-    network: &Network,
-    hidden_activation: &str,
-    mutations: Vec<String>,
-    baseline_mse: f32,
-    tolerance: f32,
-    hardware: &HardwareProfile,
-    batch_size: usize,
-) -> CandidateResult {
-    let candidate_mse = mse(network, &Dataset {
-        inputs: Vec::new(),
-        targets: Vec::new(),
-    });
-
-    // Recomputed by the caller after training; this branch is unreachable in
-    // normal use and exists only to keep the construction centralized.
-    let _ = candidate_mse;
-
-    CandidateResult {
-        id,
-        origin: origin.to_owned(),
-        topology: network.topology(),
-        hidden_activation: hidden_activation.to_owned(),
-        mutations,
-        parameters: network.parameter_count(),
-        dense_parameters: network.dense_parameter_count(),
-        active_connections: network.active_connection_count(),
-        macs: network.mac_count(),
-        mse: 0.0,
-        energy_pj: estimate_energy(network, hardware, batch_size),
-        accuracy_accepted: false || baseline_mse <= tolerance,
-    }
-}
-
 pub fn search(
     dataset: &Dataset,
     cfg: &SearchConfig,
