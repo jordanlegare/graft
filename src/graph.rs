@@ -370,7 +370,7 @@ impl GraphNetwork {
             let output = match &node.op {
                 GraphOp::Input { .. } => input.to_vec(),
                 GraphOp::Dense { input: width, output } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     let mut y = vec![0.0; *output];
 
                     for (o, y_value) in
@@ -396,9 +396,9 @@ impl GraphNetwork {
                     kernel,
                     stride,
                 } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     conv1d(
-                        x,
+                        &x,
                         *input_channels,
                         *output_channels,
                         *kernel,
@@ -408,7 +408,7 @@ impl GraphNetwork {
                     )?
                 }
                 GraphOp::SelfAttention { channels, heads } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     self_attention(
                         x,
                         *channels,
@@ -421,7 +421,7 @@ impl GraphNetwork {
                     input_size,
                     hidden_size,
                 } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     recurrent(
                         x,
                         *input_size,
@@ -465,7 +465,7 @@ impl GraphNetwork {
                     y
                 }
                 GraphOp::Activation { activation } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     x.iter()
                         .map(|value| activation.apply(*value))
                         .collect()
@@ -659,7 +659,7 @@ impl GraphNetwork {
                     caches.insert(*id, TrainingCache::Input);
                 }
                 GraphOp::Dense { input: width, output } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     let mut y = vec![0.0; *output];
 
                     for (o, y_value) in
@@ -691,9 +691,9 @@ impl GraphNetwork {
                     kernel,
                     stride,
                 } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     let y = conv1d(
-                        x,
+                        &x,
                         *input_channels,
                         *output_channels,
                         *kernel,
@@ -711,10 +711,10 @@ impl GraphNetwork {
                     );
                 }
                 GraphOp::SelfAttention { channels, heads } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     let (y, q, k, v, probabilities) =
                         self_attention_training_forward(
-                            x,
+                            &x,
                             *channels,
                             *heads,
                             &node.weights,
@@ -737,10 +737,10 @@ impl GraphNetwork {
                     input_size,
                     hidden_size,
                 } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     let (y, states) =
                         recurrent_training_forward(
-                            x,
+                            &x,
                             *input_size,
                             *hidden_size,
                             &node.weights,
@@ -787,7 +787,7 @@ impl GraphNetwork {
                     caches.insert(*id, TrainingCache::Add);
                 }
                 GraphOp::Activation { activation } => {
-                    let x = single_input(&values, node)?;
+                    let x = single_input(&values, node)?.to_vec();
                     let y = x
                         .iter()
                         .map(|value| activation.apply(*value))
@@ -1248,7 +1248,7 @@ fn backward_node(
 ) -> anyhow::Result<Vec<(usize, Vec<f32>)>> {
     match cache {
         TrainingCache::Input => Ok(Vec::new()),
-        TrainingCache::Dense { input } => {
+        TrainingCache::Dense { input: _ } => {
             let GraphOp::Dense { input: width, output } = &node.op else {
                 anyhow::bail!("dense cache does not match node {}", node.id);
             };
@@ -1515,9 +1515,6 @@ fn backward_node(
             for time in (0..length).rev() {
                 let state_base =
                     (time + 1) * *hidden_size;
-                let previous_state_base =
-                    time * *hidden_size;
-
                 let mut gradient_pre =
                     vec![0.0; *hidden_size];
 
@@ -2191,22 +2188,8 @@ fn recurrent_training_forward(
         }
     }
 
-    let output = (0..length)
-        .flat_map(|time| {
-            (0..hidden_size).map(
-                move |hidden| {
-                    states[
-                        (time + 1)
-                            * hidden_size
-                            + hidden
-                    ]
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-
     let mut channel_major =
-        vec![0.0; output.len()];
+        vec![0.0; hidden_size * length];
 
     for time in 0..length {
         for hidden in 0..hidden_size {
