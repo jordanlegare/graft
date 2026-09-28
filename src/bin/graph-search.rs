@@ -179,14 +179,14 @@ fn main() -> Result<()> {
         serde_json::to_string_pretty(&rows)?,
     )?;
 
-    if let Some(path) = args.export_best.as_deref() {
-        if let Some((_, graph)) = results.first() {
-            fs::write(
-                path,
-                serde_json::to_string_pretty(graph)?,
-            )?;
-            println!("Exported graph to {path}");
-        }
+    if let Some(path) = args.export_best.as_deref()
+        && let Some((_, graph)) = results.first()
+    {
+        fs::write(
+            path,
+            serde_json::to_string_pretty(graph)?,
+        )?;
+        println!("Exported graph to {path}");
     }
 
     println!("Results written to {}", args.output);
