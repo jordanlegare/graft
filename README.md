@@ -1,7 +1,7 @@
 # Graft
 
-Graft is a Rust prototype for discovering lower-compute dense neural-network
-topologies from an existing model's weights, biases, tensor shapes, activation
+Graft is a Rust prototype for discovering lower-compute neural-network
+topologies and graph structures from model parameters, tensor shapes, operator
 metadata, and representative input/target samples.
 
 ## Search modes
@@ -48,6 +48,35 @@ limits so the search remains usable on larger MLPs.
 Connections have an explicit active mask. This lets the search engine
 represent sparse topology instead of treating every zero weight as a dense
 connection.
+
+### General graph search
+
+Graft now also has a graph-level intermediate representation and structural
+search path for architectures that are not representable as a simple MLP:
+
+- **1-D convolution** with configurable channels, kernel, and stride
+- **multi-head self-attention** with learned Q/K/V/O projections
+- **recurrent sequence nodes** with explicit hidden-state recurrence
+- **residual / additive branches**
+- **arbitrary directed acyclic graphs** with validated topological execution,
+  rewiring, operator replacement, node insertion, and node removal
+
+The graph runtime performs shape inference and cycle detection before every
+candidate is evaluated. Graph mutations preserve tensor compatibility and the
+final output shape, so DAG search remains compatible with supervised MSE
+selection and the train/validation/holdout protocol.
+
+Generate the multi-operator graph seed and run the graph search with:
+
+~~~
+cargo run --release --bin graph-seed
+cargo run --release --bin graph-search -- --graph seed/graph.json --dataset seed/graph-dataset.json --candidates 32 --mutations 4 --validation-fraction 0.15 --holdout-fraction 0.15 --split-seed 42 --export-best seed/grafted-graph.json
+~~~
+
+`graph.json` is the serialized `GraphNetwork` IR, so graph architectures can be
+saved, mutated, evaluated, and exported without being flattened into dense
+MLP layers. The graph seed intentionally contains convolution, attention,
+recurrent, residual, and dense nodes so CI exercises all of them.
 
 ### Random architecture search
 
@@ -173,11 +202,14 @@ row-major as [output, input].
 
 ## Scope
 
-This stage searches feed-forward dense MLPs. Convolutional, attention,
-recurrent, residual, and arbitrary DAG graph transformations are not yet
-implemented.
+Graft now supports two structural search paths: the original behavior-aware
+sparse MLP search and a general graph search path covering convolution,
+attention, recurrence, residual branches, and arbitrary DAG rewrites. The
+graph path uses an explicit graph IR rather than encoding non-sequential
+architectures as dense-layer masks.
 
-The intended next stage is hardware-aware compilation of the exported masks
-and sparse weights, followed by real-device energy measurement.
+The next hardware stage is compilation of the discovered graph/operator
+structure into target-specific kernels and sparse layouts, followed by
+real-device energy measurement.
 
 CI formats the workspace before compile and test.
