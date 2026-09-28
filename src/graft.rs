@@ -738,7 +738,16 @@ pub fn apply_guided_mutation<R: Rng>(
         4 => {
             let source = weakest_connection(network)?;
             let target = inactive_edge(network)?;
-            rewire_connection(network, source, target)
+            let (layer, output, input) = source;
+            let (_, target_output, target_input) = target;
+
+            MutationKind::RewireConnection {
+                layer,
+                from_output: output,
+                from_input: input,
+                to_output: target_output,
+                to_input: target_input,
+            }
         }
         _ => return None,
     };
