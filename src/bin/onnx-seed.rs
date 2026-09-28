@@ -72,6 +72,14 @@ fn main() -> Result<()> {
     write_f32("seed/W1.bin", &w1)?;
     write_f32("seed/b1.bin", &b1)?;
 
+    let onnx_w0: Vec<f32> = (0..INPUT)
+        .flat_map(|i| (0..HIDDEN).map(move |h| w0[h * INPUT + i]))
+        .collect();
+
+    let onnx_w1: Vec<f32> = (0..HIDDEN)
+        .flat_map(|h| (0..OUTPUT).map(move |o| w1[o * HIDDEN + h]))
+        .collect();
+
     let graph = GraphProto {
         node: vec![
             NodeProto {
@@ -107,9 +115,9 @@ fn main() -> Result<()> {
         ],
         name: Some("GraftSeed".into()),
         initializer: vec![
-            float_tensor("W0", &[INPUT, HIDDEN], &w0),
+            float_tensor("W0", &[INPUT, HIDDEN], &onnx_w0),
             float_tensor("b0", &[HIDDEN], &b0),
-            float_tensor("W1", &[HIDDEN, OUTPUT], &w1),
+            float_tensor("W1", &[HIDDEN, OUTPUT], &onnx_w1),
             float_tensor("b1", &[OUTPUT], &b1),
         ],
         input: vec![value_info("X", &[1, INPUT])],
