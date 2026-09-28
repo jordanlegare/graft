@@ -683,7 +683,7 @@ impl GraphNetwork {
                                 .copied()
                                 .is_some_and(|shape| {
                                     node.inputs
-                                        .get(0)
+                                        .first()
                                         .and_then(|input| shapes.get(input))
                                         .is_some_and(|input_shape| {
                                             *input_shape == shape
@@ -708,9 +708,7 @@ impl GraphNetwork {
             }
             1 => {
                 let node = selectable[rng.random_range(0..selectable.len())];
-                let Some(input) = node.inputs.first() else {
-                    return None;
-                };
+                let input = node.inputs.first()?;
                 let shape = shapes[input];
 
                 let op = match rng.random_range(0..4) {
