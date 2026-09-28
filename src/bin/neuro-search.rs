@@ -348,6 +348,10 @@ fn main() -> Result<()> {
         "similarity_threshold must be between 0 and 1"
     );
     anyhow::ensure!(
+        args.min_width >= 1,
+        "min_width must be at least 1"
+    );
+    anyhow::ensure!(
         args.max_width >= 1,
         "max_width must be at least 1"
     );
