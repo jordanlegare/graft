@@ -485,7 +485,6 @@ fn main() -> Result<()> {
     );
 
     let baseline_validation_mse = mse(&baseline, &validation_dataset);
-    let baseline_holdout_mse = mse(&baseline, &holdout_dataset);
     let baseline_energy =
         graft::energy::estimate_energy(
             &baseline,
@@ -514,10 +513,6 @@ fn main() -> Result<()> {
     println!(
         "  validation MSE: {:.8}",
         baseline_validation_mse
-    );
-    println!(
-        "  holdout MSE: {:.8}",
-        baseline_holdout_mse
     );
     println!(
         "  estimated energy: {:.3} pJ",
@@ -565,8 +560,13 @@ fn main() -> Result<()> {
         );
 
     evaluate_holdout(&mut results, &holdout_dataset);
+    let baseline_holdout_mse = mse(&baseline, &holdout_dataset);
 
     println!();
+    println!(
+        "Final holdout reference (baseline): {:.8}",
+        baseline_holdout_mse
+    );
     println!("Top candidates:");
 
     for candidate in results.iter().take(20) {
