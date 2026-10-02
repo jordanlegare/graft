@@ -5,3 +5,5 @@ pub mod graft;
 pub mod model;
 pub mod onnx;
 pub mod search;
+
+pub mod statistics;
