@@ -52,6 +52,77 @@ impl HardwareProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WorkloadCost {
+    pub macs: u64,
+    pub memory_reads: u64,
+    pub memory_writes: u64,
+    pub activation_ops: u64,
+}
+
+impl WorkloadCost {
+    pub fn scale(self, factor: usize) -> Self {
+        let factor = factor as u64;
+        Self {
+            macs: self.macs.saturating_mul(factor),
+            memory_reads: self.memory_reads.saturating_mul(factor),
+            memory_writes: self.memory_writes.saturating_mul(factor),
+            activation_ops: self.activation_ops.saturating_mul(factor),
+        }
+    }
+
+    pub fn add_assign(&mut self, other: Self) {
+        self.macs = self.macs.saturating_add(other.macs);
+        self.memory_reads =
+            self.memory_reads.saturating_add(other.memory_reads);
+        self.memory_writes =
+            self.memory_writes.saturating_add(other.memory_writes);
+        self.activation_ops =
+            self.activation_ops.saturating_add(other.activation_ops);
+    }
+}
+
+pub fn estimate_energy_from_cost(
+    cost: WorkloadCost,
+    hardware: &HardwareProfile,
+) -> f64 {
+    cost.macs as f64 * hardware.mac_energy_pj
+        + cost.memory_reads as f64
+            * hardware.memory_read_energy_pj
+        + cost.memory_writes as f64
+            * hardware.memory_write_energy_pj
+        + cost.activation_ops as f64
+            * hardware.activation_energy_pj
+}
+
+pub fn network_workload_cost(
+    network: &Network,
+    batch_size: usize,
+) -> WorkloadCost {
+    let batch = batch_size as u64;
+    let mut cost = WorkloadCost::default();
+
+    for layer in &network.layers {
+        let active = layer.active_count() as u64;
+        let outputs = layer.output as u64;
+
+        cost.macs = cost.macs.saturating_add(
+            batch.saturating_mul(active),
+        );
+        cost.memory_reads = cost.memory_reads.saturating_add(
+            batch.saturating_mul(active + layer.bias.len() as u64),
+        );
+        cost.memory_writes = cost.memory_writes.saturating_add(
+            batch.saturating_mul(outputs),
+        );
+        cost.activation_ops = cost.activation_ops.saturating_add(
+            batch.saturating_mul(outputs),
+        );
+    }
+
+    cost
+}
+
 /// Estimates the energy of one inference batch using a simple analytical model.
 ///
 /// The estimate intentionally uses the active connection mask for MACs and
@@ -63,28 +134,10 @@ pub fn estimate_energy(
     hardware: &HardwareProfile,
     batch_size: usize,
 ) -> f64 {
-    let batch = batch_size as f64;
-    let mut energy = 0.0;
-
-    for layer in &network.layers {
-        let active = layer.active_count() as f64;
-        let outputs = layer.output as f64;
-        let bias_reads = layer.bias.len() as f64;
-
-        let macs = batch * active;
-        let weight_reads = batch * active;
-        let bias_reads = batch * bias_reads;
-        let writes = batch * outputs;
-        let activations = batch * outputs;
-
-        energy += macs * hardware.mac_energy_pj;
-        energy += weight_reads * hardware.memory_read_energy_pj;
-        energy += bias_reads * hardware.memory_read_energy_pj;
-        energy += writes * hardware.memory_write_energy_pj;
-        energy += activations * hardware.activation_energy_pj;
-    }
-
-    energy
+    estimate_energy_from_cost(
+        network_workload_cost(network, batch_size),
+        hardware,
+    )
 }
 
 #[cfg(test)]
@@ -136,6 +189,20 @@ mod tests {
             .abs()
             < 1e-9);
         assert!((sparse_energy - non_edge_cost).abs() < 1e-9);
+    }
+
+    #[test]
+    fn workload_cost_matches_sparse_network_accounting() {
+        let mut rng = rand::rng();
+        let network =
+            random_network(&[2, 3], Activation::Relu, &mut rng)
+                .expect("network");
+
+        let cost = network_workload_cost(&network, 2);
+        assert_eq!(cost.macs, 12);
+        assert_eq!(cost.memory_reads, 18);
+        assert_eq!(cost.memory_writes, 6);
+        assert_eq!(cost.activation_ops, 6);
     }
 
     #[test]

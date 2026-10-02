@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use graft::{
     data::Dataset,
+    energy::HardwareProfile,
     graph::{
         graph_mse, search_graph, GraphNetwork, GraphSearchConfig,
     },
@@ -37,6 +38,21 @@ struct Args {
     #[arg(long, default_value_t = 0.01)]
     accuracy_tolerance: f32,
 
+    #[arg(long, default_value_t = 0.01)]
+    relative_accuracy_tolerance: f32,
+
+    #[arg(long, default_value_t = 1000)]
+    bootstrap_samples: usize,
+
+    #[arg(long, default_value_t = 1)]
+    batch_size: usize,
+
+    #[arg(long, default_value_t = 0)]
+    training_macs_budget: u64,
+
+    #[arg(long)]
+    hardware: Option<String>,
+
     #[arg(long, default_value_t = 0.15)]
     validation_fraction: f32,
 
@@ -60,10 +76,19 @@ struct Args {
 struct ResultRow {
     id: usize,
     validation_mse: f32,
-    holdout_mse: f32,
+    validation_delta_mean: f32,
+    validation_delta_ucb: f32,
+    acceptance_tolerance: f32,
+    holdout_mse: Option<f32>,
     accuracy_accepted: bool,
     parameters: usize,
     macs: u64,
+    memory_reads: u64,
+    memory_writes: u64,
+    activation_ops: u64,
+    energy_pj: f64,
+    training_epochs: usize,
+    pareto_optimal: bool,
     mutations: Vec<String>,
 }
 
@@ -89,6 +114,21 @@ fn main() -> Result<()> {
         args.learning_rate > 0.0 && args.learning_rate.is_finite(),
         "learning_rate must be finite and > 0"
     );
+    anyhow::ensure!(
+        args.relative_accuracy_tolerance >= 0.0
+            && args.relative_accuracy_tolerance.is_finite(),
+        "relative_accuracy_tolerance must be finite and >= 0"
+    );
+    anyhow::ensure!(
+        args.bootstrap_samples > 0,
+        "bootstrap_samples must be > 0"
+    );
+    anyhow::ensure!(
+        args.batch_size > 0,
+        "batch_size must be > 0"
+    );
+
+    let hardware = HardwareProfile::load(args.hardware.as_deref())?;
 
     let graph: GraphNetwork =
         serde_json::from_str(
@@ -136,6 +176,12 @@ fn main() -> Result<()> {
             epochs: args.epochs,
             learning_rate: args.learning_rate,
             accuracy_tolerance: args.accuracy_tolerance,
+            relative_accuracy_tolerance: args.relative_accuracy_tolerance,
+            bootstrap_samples: args.bootstrap_samples,
+            batch_size: args.batch_size,
+            training_macs_budget: (args.training_macs_budget > 0)
+                .then_some(args.training_macs_budget),
+            hardware,
         },
         &mut rng,
     )?;
@@ -166,17 +212,23 @@ fn main() -> Result<()> {
 
     let mut rows = Vec::with_capacity(results.len());
 
-    for (candidate, network) in &results {
-        let holdout_mse =
-            dataset_mse(network, &holdout)?;
-
+    for (candidate, _network) in &results {
         rows.push(ResultRow {
             id: candidate.id,
             validation_mse: candidate.mse,
-            holdout_mse,
+            validation_delta_mean: candidate.validation_delta_mean,
+            validation_delta_ucb: candidate.validation_delta_ucb,
+            acceptance_tolerance: candidate.acceptance_tolerance,
+            holdout_mse: None,
             accuracy_accepted: candidate.accuracy_accepted,
             parameters: candidate.parameters,
             macs: candidate.macs,
+            memory_reads: candidate.memory_reads,
+            memory_writes: candidate.memory_writes,
+            activation_ops: candidate.activation_ops,
+            energy_pj: candidate.energy_pj,
+            training_epochs: candidate.training_epochs,
+            pareto_optimal: candidate.pareto_optimal,
             mutations: candidate
                 .mutations
                 .iter()
@@ -185,17 +237,11 @@ fn main() -> Result<()> {
         });
     }
 
-    rows.sort_by(|a, b| {
-        b.accuracy_accepted
-            .cmp(&a.accuracy_accepted)
-            .then_with(|| a.macs.cmp(&b.macs))
-            .then_with(|| {
-                a.validation_mse
-                    .partial_cmp(&b.validation_mse)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    if let Some(row) = rows.first_mut() {
+        row.holdout_mse = Some(
+            dataset_mse(&results[0].1, &holdout)?
+        );
+    }
 
     fs::write(
         &args.output,

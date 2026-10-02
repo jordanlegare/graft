@@ -1,5 +1,9 @@
-use crate::model::Activation;
-use rand::Rng;
+use crate::{
+    energy::{HardwareProfile, WorkloadCost},
+    model::Activation,
+    statistics,
+};
+use rand::{Rng, SeedableRng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -279,6 +283,149 @@ impl GraphNetwork {
             .sum()
     }
 
+    pub fn workload_cost(&self, batch_size: usize) -> WorkloadCost {
+        let shapes = match self.infer_shapes() {
+            Ok(shapes) => shapes,
+            Err(_) => return WorkloadCost::default(),
+        };
+
+        let batch = batch_size as u64;
+        let mut cost = WorkloadCost::default();
+
+        for node in &self.nodes {
+            let shape = shapes.get(&node.id).copied();
+            let output_size = shape.map(TensorShape::size).unwrap_or(0) as u64;
+
+            match &node.op {
+                GraphOp::Input { .. } => {}
+                GraphOp::Dense { .. } => {
+                    cost.macs = cost.macs.saturating_add(
+                        batch.saturating_mul(node.weights.len() as u64),
+                    );
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(
+                            node.weights.len() as u64
+                                + node.bias.len() as u64,
+                        ),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.activation_ops = cost.activation_ops.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+                GraphOp::Conv1d {
+                    input_channels,
+                    output_channels,
+                    kernel,
+                    stride,
+                } => {
+                    let Some(input) = node.inputs.first()
+                        .and_then(|id| shapes.get(id))
+                    else {
+                        continue;
+                    };
+                    let output_length =
+                        valid_conv_output_length(input.length, *kernel, *stride);
+                    let macs = output_length
+                        * output_channels
+                        * input_channels
+                        * kernel;
+
+                    cost.macs = cost.macs.saturating_add(
+                        batch.saturating_mul(macs as u64),
+                    );
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(
+                            node.weights.len() as u64
+                                + node.bias.len() as u64,
+                        ),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+                GraphOp::SelfAttention { channels, .. } => {
+                    let Some(input) = node.inputs.first()
+                        .and_then(|id| shapes.get(id))
+                    else {
+                        continue;
+                    };
+                    let sequence = input.length as u64;
+                    let channels = *channels as u64;
+                    let macs = 4 * sequence * channels * channels
+                        + 2 * sequence * sequence * channels;
+
+                    cost.macs = cost.macs.saturating_add(
+                        batch.saturating_mul(macs),
+                    );
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(
+                            node.weights.len() as u64
+                                + node.bias.len() as u64,
+                        ),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.activation_ops = cost.activation_ops.saturating_add(
+                        batch.saturating_mul(sequence * sequence),
+                    );
+                }
+                GraphOp::Recurrent { input_size, hidden_size } => {
+                    let Some(input) = node.inputs.first()
+                        .and_then(|id| shapes.get(id))
+                    else {
+                        continue;
+                    };
+                    let macs = input.length
+                        * hidden_size
+                        * (input_size + hidden_size);
+
+                    cost.macs = cost.macs.saturating_add(
+                        batch.saturating_mul(macs as u64),
+                    );
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(
+                            node.weights.len() as u64
+                                + node.bias.len() as u64,
+                        ),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.activation_ops = cost.activation_ops.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+                GraphOp::Add => {
+                    let input_reads =
+                        node.inputs.len() as u64 * output_size;
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(input_reads),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+                GraphOp::Activation { .. } => {
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.activation_ops = cost.activation_ops.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+            }
+        }
+
+        cost
+    }
+
     pub fn mac_count(&self) -> u64 {
         let shapes = match self.infer_shapes() {
             Ok(shapes) => shapes,
@@ -498,6 +645,45 @@ impl GraphNetwork {
         for _ in 0..epochs {
             for (input, target) in inputs.iter().zip(targets) {
                 self.train_sample(input, target, learning_rate)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn train_shuffled(
+        &mut self,
+        inputs: &[Vec<f32>],
+        targets: &[Vec<f32>],
+        epochs: usize,
+        learning_rate: f32,
+        seed: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            inputs.len() == targets.len(),
+            "training input/target counts differ"
+        );
+        anyhow::ensure!(!inputs.is_empty(), "training dataset is empty");
+        anyhow::ensure!(epochs > 0, "training epochs must be > 0");
+        anyhow::ensure!(
+            learning_rate > 0.0 && learning_rate.is_finite(),
+            "learning_rate must be finite and > 0"
+        );
+
+        self.validate()?;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut order = (0..inputs.len()).collect::<Vec<_>>();
+
+        for _ in 0..epochs {
+            order.shuffle(&mut rng);
+
+            for index in &order {
+                self.train_sample(
+                    &inputs[*index],
+                    &targets[*index],
+                    learning_rate,
+                )?;
             }
         }
 
@@ -2784,6 +2970,11 @@ pub struct GraphSearchConfig {
     pub epochs: usize,
     pub learning_rate: f32,
     pub accuracy_tolerance: f32,
+    pub relative_accuracy_tolerance: f32,
+    pub bootstrap_samples: usize,
+    pub batch_size: usize,
+    pub training_macs_budget: Option<u64>,
+    pub hardware: HardwareProfile,
 }
 
 impl Default for GraphSearchConfig {
@@ -2794,6 +2985,11 @@ impl Default for GraphSearchConfig {
             epochs: 5,
             learning_rate: 0.01,
             accuracy_tolerance: 0.01,
+            relative_accuracy_tolerance: 0.01,
+            bootstrap_samples: 1000,
+            batch_size: 1,
+            training_macs_budget: None,
+            hardware: HardwareProfile::default(),
         }
     }
 }
@@ -2802,10 +2998,107 @@ impl Default for GraphSearchConfig {
 pub struct GraphCandidate {
     pub id: usize,
     pub mse: f32,
+    pub validation_delta_mean: f32,
+    pub validation_delta_ucb: f32,
+    pub acceptance_tolerance: f32,
     pub accuracy_accepted: bool,
     pub parameters: usize,
     pub macs: u64,
+    pub memory_reads: u64,
+    pub memory_writes: u64,
+    pub activation_ops: u64,
+    pub energy_pj: f64,
+    pub training_epochs: usize,
+    pub training_macs: u64,
+    pub pareto_optimal: bool,
     pub mutations: Vec<GraphMutation>,
+}
+
+fn training_epochs_for_budget(
+    sample_count: usize,
+    macs: u64,
+    configured_epochs: usize,
+    training_macs_budget: Option<u64>,
+) -> usize {
+    match training_macs_budget {
+        Some(budget) if budget > 0 => {
+            let per_epoch = (macs.max(1) as u128)
+                .saturating_mul(sample_count.max(1) as u128);
+            ((budget as u128) / per_epoch)
+                .clamp(1, usize::MAX as u128) as usize
+        }
+        _ => configured_epochs,
+    }
+}
+
+pub fn sample_mse_losses(
+    network: &GraphNetwork,
+    inputs: &[Vec<f32>],
+    targets: &[Vec<f32>],
+) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(
+        inputs.len() == targets.len(),
+        "graph input/target counts differ"
+    );
+    anyhow::ensure!(!inputs.is_empty(), "graph evaluation dataset is empty");
+
+    let mut losses = Vec::with_capacity(inputs.len());
+
+    for (input, target) in inputs.iter().zip(targets) {
+        let output = network.forward(input)?;
+
+        anyhow::ensure!(
+            output.len() == target.len(),
+            "graph output width {} != target width {}",
+            output.len(),
+            target.len()
+        );
+
+        let loss = output
+            .iter()
+            .zip(target)
+            .map(|(prediction, expected)| {
+                let delta = *prediction as f64 - *expected as f64;
+                delta * delta
+            })
+            .sum::<f64>()
+            / output.len().max(1) as f64;
+
+        losses.push(loss as f32);
+    }
+
+    Ok(losses)
+}
+
+fn pareto_flags(
+    results: &mut [(GraphCandidate, GraphNetwork)],
+) {
+    for i in 0..results.len() {
+        let mut pareto = results[i].0.accuracy_accepted;
+
+        if pareto {
+            for j in 0..results.len() {
+                if i == j || !results[j].0.accuracy_accepted {
+                    continue;
+                }
+
+                let i_energy = results[i].0.energy_pj;
+                let j_energy = results[j].0.energy_pj;
+                let i_mse = results[i].0.mse;
+                let j_mse = results[j].0.mse;
+
+                if j_energy <= i_energy
+                    && j_mse <= i_mse
+                    && (j_energy < i_energy || j_mse < i_mse)
+                {
+                    pareto = false;
+                    break;
+                }
+            }
+        }
+
+        results[i].0.pareto_optimal = pareto;
+    }
 }
 
 pub fn search_graph<R: Rng>(
@@ -2825,54 +3118,123 @@ pub fn search_graph<R: Rng>(
         validation_inputs.len() == validation_targets.len(),
         "validation input/target counts differ"
     );
-    anyhow::ensure!(config.candidates > 0, "graph candidate count must be > 0");
-    anyhow::ensure!(config.mutations > 0, "graph mutation count must be > 0");
-    anyhow::ensure!(config.epochs > 0, "graph training epochs must be > 0");
+    anyhow::ensure!(!train_inputs.is_empty(), "graph training dataset is empty");
+    anyhow::ensure!(
+        config.candidates > 0,
+        "graph candidate count must be > 0"
+    );
+    anyhow::ensure!(
+        config.mutations > 0,
+        "graph mutation count must be > 0"
+    );
+    anyhow::ensure!(
+        config.epochs > 0,
+        "graph training epochs must be > 0"
+    );
     anyhow::ensure!(
         config.accuracy_tolerance.is_finite()
             && config.accuracy_tolerance >= 0.0,
         "graph accuracy_tolerance must be finite and >= 0"
     );
     anyhow::ensure!(
+        config.relative_accuracy_tolerance.is_finite()
+            && config.relative_accuracy_tolerance >= 0.0,
+        "graph relative_accuracy_tolerance must be finite and >= 0"
+    );
+    anyhow::ensure!(
+        config.bootstrap_samples > 0,
+        "graph bootstrap_samples must be > 0"
+    );
+    anyhow::ensure!(
+        config.batch_size > 0,
+        "graph batch_size must be > 0"
+    );
+    anyhow::ensure!(
         config.learning_rate > 0.0
             && config.learning_rate.is_finite(),
         "graph learning_rate must be finite and > 0"
     );
+    config.hardware.validate()?;
 
-    let baseline_mse =
-        graph_mse(baseline, validation_inputs, validation_targets)?;
-
+    let baseline_losses =
+        sample_mse_losses(baseline, validation_inputs, validation_targets)?;
+    let baseline_mse = statistics::mean(&baseline_losses);
     let mut results = Vec::with_capacity(config.candidates);
 
     for id in 0..config.candidates {
         let mut candidate = baseline.clone();
-        let mutations =
-            candidate.mutate(rng, config.mutations);
+        let mutations = candidate.mutate(rng, config.mutations);
 
-        candidate.train(
+        let candidate_macs = candidate.mac_count();
+        let training_epochs = training_epochs_for_budget(
+            train_inputs.len(),
+            candidate_macs,
+            config.epochs,
+            config.training_macs_budget,
+        );
+
+        candidate.train_shuffled(
             train_inputs,
             train_targets,
-            config.epochs,
+            training_epochs,
             config.learning_rate,
+            id as u64 ^ 0x9E3779B97F4A7C15,
         )?;
 
-        let mse =
-            graph_mse(&candidate, validation_inputs, validation_targets)?;
-        let accuracy_accepted =
-            mse <= baseline_mse + config.accuracy_tolerance;
+        let losses =
+            sample_mse_losses(&candidate, validation_inputs, validation_targets)?;
+        let mse = statistics::mean(&losses);
+        let differences = losses
+            .iter()
+            .zip(&baseline_losses)
+            .map(|(candidate_loss, baseline_loss)| {
+                *candidate_loss - *baseline_loss
+            })
+            .collect::<Vec<_>>();
+
+        let paired = statistics::paired_test(
+            &differences,
+            baseline_mse,
+            config.accuracy_tolerance,
+            config.relative_accuracy_tolerance,
+            config.bootstrap_samples,
+            id as u64 ^ 0xD1B54A32D192ED03,
+        );
+
+        let cost = candidate.workload_cost(config.batch_size);
+        let energy =
+            crate::energy::estimate_energy_from_cost(
+                cost,
+                &config.hardware,
+            );
+        let training_macs = candidate_macs
+            .saturating_mul(training_epochs as u64)
+            .saturating_mul(train_inputs.len() as u64);
 
         results.push((
             GraphCandidate {
                 id,
                 mse,
-                accuracy_accepted,
+                validation_delta_mean: paired.mean_difference,
+                validation_delta_ucb: paired.upper_confidence_bound,
+                acceptance_tolerance: paired.tolerance,
+                accuracy_accepted: paired.accepted,
                 parameters: candidate.parameter_count(),
-                macs: candidate.mac_count(),
+                macs: candidate_macs,
+                memory_reads: cost.memory_reads,
+                memory_writes: cost.memory_writes,
+                activation_ops: cost.activation_ops,
+                energy_pj: energy,
+                training_epochs,
+                training_macs,
+                pareto_optimal: false,
                 mutations,
             },
             candidate,
         ));
     }
+
+    pareto_flags(&mut results);
 
     results.sort_by(|a, b| {
         match (a.0.accuracy_accepted, b.0.accuracy_accepted) {
@@ -2880,13 +3242,12 @@ pub fn search_graph<R: Rng>(
             (false, true) => Ordering::Greater,
             _ => a
                 .0
-                .macs
-                .cmp(&b.0.macs)
-                .then_with(|| {
-                    a.0.mse
-                        .partial_cmp(&b.0.mse)
-                        .unwrap_or(Ordering::Equal)
-                }),
+                .pareto_optimal
+                .cmp(&b.0.pareto_optimal)
+                .reverse()
+                .then_with(|| a.0.energy_pj.total_cmp(&b.0.energy_pj))
+                .then_with(|| a.0.mse.total_cmp(&b.0.mse))
+                .then_with(|| a.0.id.cmp(&b.0.id)),
         }
     });
 
@@ -2903,32 +3264,9 @@ pub fn graph_mse(
     inputs: &[Vec<f32>],
     targets: &[Vec<f32>],
 ) -> anyhow::Result<f32> {
-    let mut error = 0.0f64;
-    let mut count = 0usize;
-
-    for (input, target) in inputs.iter().zip(targets) {
-        let output = network.forward(input)?;
-
-        anyhow::ensure!(
-            output.len() == target.len(),
-            "graph output width {} != target width {}",
-            output.len(),
-            target.len()
-        );
-
-        for (prediction, expected) in
-            output.iter().zip(target)
-        {
-            let delta =
-                *prediction as f64 - *expected as f64;
-            error += delta * delta;
-            count += 1;
-        }
-    }
-
-    anyhow::ensure!(count > 0, "validation dataset is empty");
-
-    Ok((error / count as f64) as f32)
+    Ok(statistics::mean(
+        &sample_mse_losses(network, inputs, targets)?,
+    ))
 }
 
 #[cfg(test)]
@@ -2936,6 +3274,83 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    fn scalar_training_loss(
+        graph: &GraphNetwork,
+        input: &[f32],
+        target: &[f32],
+    ) -> f32 {
+        let output = graph.forward(input).expect("forward");
+        output
+            .iter()
+            .zip(target)
+            .map(|(prediction, expected)| {
+                let delta = *prediction - *expected;
+                0.5 * delta * delta
+            })
+            .sum()
+    }
+
+    fn assert_weight_gradient(
+        graph: &GraphNetwork,
+        node_id: usize,
+        weight_index: usize,
+        input: &[f32],
+        target: &[f32],
+        label: &str,
+    ) {
+        let learning_rate = 1e-4f32;
+        let epsilon = 1e-3f32;
+        let before = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .expect("node")
+            .weights[weight_index];
+
+        let plus = {
+            let mut candidate = graph.clone();
+            let node = candidate
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                .expect("node");
+            node.weights[weight_index] += epsilon;
+            scalar_training_loss(&candidate, input, target)
+        };
+        let minus = {
+            let mut candidate = graph.clone();
+            let node = candidate
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                .expect("node");
+            node.weights[weight_index] -= epsilon;
+            scalar_training_loss(&candidate, input, target)
+        };
+
+        let numerical = (plus - minus) / (2.0 * epsilon);
+
+        let mut trained = graph.clone();
+        trained
+            .train(&[input.to_vec()], &[target.to_vec()], 1, learning_rate)
+            .expect("one step");
+        let after = trained
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .expect("node")
+            .weights[weight_index];
+
+        let analytical = (before - after) / learning_rate;
+        let relative_error = (analytical - numerical).abs()
+            / (1.0 + analytical.abs() + numerical.abs());
+
+        assert!(
+            relative_error < 2e-2,
+            "{label}: analytical={analytical}, numerical={numerical}, relative_error={relative_error}"
+        );
+    }
 
     #[test]
     fn convolution_forward_has_expected_shape() {
@@ -2990,6 +3405,54 @@ mod tests {
         assert_eq!(
             graph.forward(&[0.1; 10]).expect("forward").len(),
             2
+        );
+    }
+
+    #[test]
+    fn convolution_gradient_matches_finite_difference() {
+        let shape = TensorShape::sequence(1, 3).expect("shape");
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let conv = GraphNode {
+            id: 1,
+            inputs: vec![0],
+            op: GraphOp::Conv1d {
+                input_channels: 1,
+                output_channels: 1,
+                kernel: 2,
+                stride: 1,
+            },
+            weights: vec![0.2, -0.1],
+            bias: vec![0.05],
+        };
+        let dense = GraphNode {
+            id: 2,
+            inputs: vec![1],
+            op: GraphOp::Dense {
+                input: 2,
+                output: 1,
+            },
+            weights: vec![0.3, 0.4],
+            bias: vec![0.1],
+        };
+        let graph = GraphNetwork {
+            nodes: vec![input, conv, dense],
+            output: 2,
+        };
+
+        graph.validate().expect("graph");
+        assert_weight_gradient(
+            &graph,
+            1,
+            0,
+            &[0.6, -0.2, 0.4],
+            &[0.7],
+            "conv",
         );
     }
 
@@ -3106,6 +3569,61 @@ mod tests {
     }
 
     #[test]
+    fn attention_gradient_matches_finite_difference() {
+        let shape = TensorShape::sequence(2, 2).expect("shape");
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let attention = GraphNode {
+            id: 1,
+            inputs: vec![0],
+            op: GraphOp::SelfAttention {
+                channels: 2,
+                heads: 1,
+            },
+            weights: vec![
+                0.10, -0.05,
+                0.03, 0.08,
+                -0.02, 0.04,
+                0.07, -0.06,
+                0.05, 0.02,
+                -0.04, 0.09,
+                0.06, -0.03,
+                0.02, 0.05,
+            ],
+            bias: vec![0.01, -0.02],
+        };
+        let dense = GraphNode {
+            id: 2,
+            inputs: vec![1],
+            op: GraphOp::Dense {
+                input: 4,
+                output: 1,
+            },
+            weights: vec![0.2, -0.1, 0.15, 0.05],
+            bias: vec![0.03],
+        };
+        let graph = GraphNetwork {
+            nodes: vec![input, attention, dense],
+            output: 2,
+        };
+
+        graph.validate().expect("graph");
+        assert_weight_gradient(
+            &graph,
+            1,
+            0,
+            &[0.2, -0.4, 0.3, 0.5],
+            &[0.1],
+            "attention",
+        );
+    }
+
+    #[test]
     fn recurrent_forward_has_expected_shape() {
         let shape =
             TensorShape::sequence(3, 4).expect("shape");
@@ -3158,6 +3676,52 @@ mod tests {
     }
 
     #[test]
+    fn recurrent_gradient_matches_finite_difference() {
+        let shape = TensorShape::sequence(1, 3).expect("shape");
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let recurrent = GraphNode {
+            id: 1,
+            inputs: vec![0],
+            op: GraphOp::Recurrent {
+                input_size: 1,
+                hidden_size: 1,
+            },
+            weights: vec![0.25, 0.10],
+            bias: vec![0.02],
+        };
+        let dense = GraphNode {
+            id: 2,
+            inputs: vec![1],
+            op: GraphOp::Dense {
+                input: 3,
+                output: 1,
+            },
+            weights: vec![0.2, -0.15, 0.1],
+            bias: vec![0.05],
+        };
+        let graph = GraphNetwork {
+            nodes: vec![input, recurrent, dense],
+            output: 2,
+        };
+
+        graph.validate().expect("graph");
+        assert_weight_gradient(
+            &graph,
+            1,
+            1,
+            &[0.6, -0.3, 0.2],
+            &[0.4],
+            "recurrent",
+        );
+    }
+
+    #[test]
     fn residual_dag_forward_and_rewire_are_valid() {
         let shape =
             TensorShape::vector(4).expect("shape");
@@ -3175,6 +3739,69 @@ mod tests {
 
         assert_eq!(residual, 4);
         assert_eq!(graph.forward(&[0.1; 4]).expect("forward").len(), 2);
+    }
+
+    #[test]
+    fn residual_and_activation_gradient_matches_finite_difference() {
+        let shape = TensorShape::vector(1).expect("shape");
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let left = GraphNode {
+            id: 1,
+            inputs: vec![0],
+            op: GraphOp::Dense { input: 1, output: 1 },
+            weights: vec![0.2],
+            bias: vec![0.1],
+        };
+        let right = GraphNode {
+            id: 2,
+            inputs: vec![0],
+            op: GraphOp::Dense { input: 1, output: 1 },
+            weights: vec![-0.1],
+            bias: vec![0.05],
+        };
+        let add = GraphNode {
+            id: 3,
+            inputs: vec![1, 2],
+            op: GraphOp::Add,
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let activation = GraphNode {
+            id: 4,
+            inputs: vec![3],
+            op: GraphOp::Activation {
+                activation: Activation::Tanh,
+            },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let output = GraphNode {
+            id: 5,
+            inputs: vec![4],
+            op: GraphOp::Dense { input: 1, output: 1 },
+            weights: vec![0.4],
+            bias: vec![0.02],
+        };
+        let graph = GraphNetwork {
+            nodes: vec![input, left, right, add, activation, output],
+            output: 5,
+        };
+
+        graph.validate().expect("graph");
+        assert_weight_gradient(
+            &graph,
+            1,
+            0,
+            &[0.7],
+            &[0.25],
+            "residual/activation",
+        );
     }
 
     #[test]
@@ -3246,6 +3873,19 @@ mod tests {
     }
 
     #[test]
+    fn graph_workload_cost_includes_non_mac_operations() {
+        let shape = TensorShape::vector(2).expect("shape");
+        let mut rng = StdRng::seed_from_u64(29);
+        let graph = random_graph(shape, 2, &mut rng).expect("graph");
+        let cost = graph.workload_cost(1);
+
+        assert!(cost.macs > 0);
+        assert!(cost.memory_reads > 0);
+        assert!(cost.memory_writes > 0);
+        assert!(cost.activation_ops > 0);
+    }
+
+    #[test]
     fn random_graph_search_produces_candidates() {
         let shape =
             TensorShape::sequence(2, 3).expect("shape");
@@ -3267,6 +3907,7 @@ mod tests {
                 epochs: 1,
                 learning_rate: 0.001,
                 accuracy_tolerance: 0.1,
+                ..GraphSearchConfig::default()
             },
             &mut rng,
         )

@@ -2,7 +2,7 @@ use crate::{
     data::Dataset,
     model::{DenseLayer, Network},
 };
-use rand::Rng;
+use rand::{Rng, seq::SliceRandom};
 use std::fmt;
 
 #[derive(Debug, Clone)]
@@ -392,6 +392,102 @@ fn merge_neurons(
     remove_column(next, second);
 }
 
+fn merge_neurons_with_trace(
+    network: &mut Network,
+    layer_idx: usize,
+    first: usize,
+    second: usize,
+    trace: &BehaviorTrace,
+    _inputs: &[Vec<f32>],
+) {
+    let layer = &network.layers[layer_idx];
+    let input_width = layer.input;
+
+    let mut merged_weights = Vec::with_capacity(input_width);
+    let mut merged_active = Vec::with_capacity(input_width);
+
+    for input in 0..input_width {
+        let first_idx = layer.index(first, input);
+        let second_idx = layer.index(second, input);
+        let first_active = layer.active[first_idx];
+        let second_active = layer.active[second_idx];
+
+        let value = match (first_active, second_active) {
+            (true, true) => {
+                (layer.weights[first_idx] + layer.weights[second_idx]) * 0.5
+            }
+            (true, false) => layer.weights[first_idx],
+            (false, true) => layer.weights[second_idx],
+            (false, false) => 0.0,
+        };
+
+        merged_weights.push(value);
+        merged_active.push(first_active || second_active);
+    }
+
+    let merged_bias = (layer.bias[first] + layer.bias[second]) * 0.5;
+
+    {
+        let layer = &mut network.layers[layer_idx];
+        let start = first * layer.input;
+        let end = start + layer.input;
+        layer.weights[start..end].copy_from_slice(&merged_weights);
+        layer.active[start..end].copy_from_slice(&merged_active);
+        layer.bias[first] = merged_bias;
+    }
+
+    // Fit each outgoing coefficient by least squares on the probe activation
+    // trace: c = argmin_c ||h_m c - (h_a w_a + h_b w_b)||^2.
+    // This is a local optimality step for the linear next-layer readout.
+    if layer_idx + 1 < network.layers.len() && !trace.samples.is_empty() {
+        let next = &mut network.layers[layer_idx + 1];
+
+        for output in 0..next.output {
+            let first_idx = next.index(output, first);
+            let second_idx = next.index(output, second);
+
+            let first_weight = if next.active[first_idx] {
+                next.weights[first_idx]
+            } else {
+                0.0
+            };
+            let second_weight = if next.active[second_idx] {
+                next.weights[second_idx]
+            } else {
+                0.0
+            };
+
+            let mut numerator = 0.0f64;
+            let mut denominator = 0.0f64;
+
+            for sample in &trace.samples {
+                let merged_activation =
+                    0.5 * (sample[first] + sample[second]);
+                let target =
+                    first_weight * sample[first]
+                        + second_weight * sample[second];
+
+                numerator +=
+                    merged_activation as f64 * target as f64;
+                denominator +=
+                    merged_activation as f64 * merged_activation as f64;
+            }
+
+            let coefficient = if denominator > 1e-12 {
+                (numerator / denominator) as f32
+            } else {
+                0.0
+            };
+
+            next.weights[first_idx] = coefficient;
+            next.active[first_idx] = coefficient.abs() > 1e-12;
+        }
+    }
+
+    remove_row(&mut network.layers[layer_idx], second);
+    remove_column(&mut network.layers[layer_idx + 1], second);
+}
+
 fn split_neuron<R: Rng>(
     network: &mut Network,
     layer_idx: usize,
@@ -555,10 +651,20 @@ struct BehaviorTrace {
     mean_abs: Vec<f32>,
     variance: Vec<f32>,
     zero_fraction: Vec<f32>,
+    weight_saliency: Vec<f32>,
+    bias_saliency: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct ParameterSaliency {
+    weights: Vec<Vec<f32>>,
+    biases: Vec<Vec<f32>>,
 }
 
 #[derive(Debug, Clone)]
 struct BehaviorProfile {
+    inputs: Vec<Vec<f32>>,
+    indices: Vec<usize>,
     layers: Vec<BehaviorTrace>,
     baseline_mse: f32,
 }
@@ -566,18 +672,16 @@ struct BehaviorProfile {
 fn behavior_mse(
     network: &Network,
     dataset: &Dataset,
-    max_samples: usize,
+    sample_indices: &[usize],
 ) -> f32 {
-    let sample_count = dataset.inputs.len().min(max_samples);
-
-    if sample_count == 0 {
+    if sample_indices.is_empty() {
         return f32::INFINITY;
     }
 
     let mut error = 0.0f64;
     let mut count = 0usize;
 
-    for index in 0..sample_count {
+    for index in sample_indices.iter().copied() {
         let Ok(output) = network.forward(&dataset.inputs[index]) else {
             return f32::INFINITY;
         };
@@ -605,9 +709,9 @@ fn behavior_mse(
 fn behavior_profile(
     network: &Network,
     dataset: &Dataset,
-    max_samples: usize,
+    sample_indices: &[usize],
 ) -> Option<BehaviorProfile> {
-    let sample_count = dataset.inputs.len().min(max_samples);
+    let sample_count = sample_indices.len();
 
     if sample_count == 0 || network.layers.is_empty() {
         return None;
@@ -621,10 +725,12 @@ fn behavior_profile(
             mean_abs: vec![0.0; layer.output],
             variance: vec![0.0; layer.output],
             zero_fraction: vec![0.0; layer.output],
+            weight_saliency: vec![0.0; layer.weights.len()],
+            bias_saliency: vec![0.0; layer.bias.len()],
         })
         .collect::<Vec<_>>();
 
-    for sample_index in 0..sample_count {
+    for sample_index in sample_indices.iter().copied() {
         let activations =
             network.forward_activations(&dataset.inputs[sample_index]).ok()?;
 
@@ -648,7 +754,6 @@ fn behavior_profile(
     for trace in &mut layers {
         for neuron in 0..trace.mean_abs.len() {
             trace.mean_abs[neuron] /= samples;
-
             trace.zero_fraction[neuron] /= samples;
 
             let mean = trace.samples
@@ -668,9 +773,169 @@ fn behavior_profile(
         }
     }
 
+    let saliency =
+        parameter_saliency(network, dataset, sample_indices)?;
+
+    for (layer, (weights, biases)) in
+        layers.iter_mut()
+            .zip(
+                saliency.weights.into_iter()
+                    .zip(saliency.biases),
+            )
+    {
+        layer.weight_saliency = weights;
+        layer.bias_saliency = biases;
+    }
+
     Some(BehaviorProfile {
+        inputs: sample_indices
+            .iter()
+            .map(|index| dataset.inputs[*index].clone())
+            .collect(),
+        indices: sample_indices.to_vec(),
         layers,
-        baseline_mse: behavior_mse(network, dataset, max_samples),
+        baseline_mse: behavior_mse(network, dataset, sample_indices),
+    })
+}
+
+fn parameter_saliency(
+    network: &Network,
+    dataset: &Dataset,
+    sample_indices: &[usize],
+) -> Option<ParameterSaliency> {
+    if sample_indices.is_empty() || network.layers.is_empty() {
+        return None;
+    }
+
+    let mut weight_saliency = network
+        .layers
+        .iter()
+        .map(|layer| vec![0.0; layer.weights.len()])
+        .collect::<Vec<_>>();
+    let mut bias_saliency = network
+        .layers
+        .iter()
+        .map(|layer| vec![0.0; layer.bias.len()])
+        .collect::<Vec<_>>();
+
+    for sample_index in sample_indices.iter().copied() {
+        let input = &dataset.inputs[sample_index];
+        let target = &dataset.targets[sample_index];
+        let mut activations = Vec::with_capacity(network.layers.len() + 1);
+        let mut preactivations =
+            Vec::with_capacity(network.layers.len());
+        activations.push(input.clone());
+
+        let mut current = input.clone();
+        for layer in &network.layers {
+            let mut z = vec![0.0; layer.output];
+            let mut y = vec![0.0; layer.output];
+
+            for output in 0..layer.output {
+                let mut sum = layer.bias[output];
+
+                for (input_index, current_value) in
+                    current.iter().enumerate().take(layer.input)
+                {
+                    let index = layer.index(output, input_index);
+                    if layer.active[index] {
+                        sum += layer.weights[index] * *current_value;
+                    }
+                }
+
+                z[output] = sum;
+                y[output] = layer.activation.apply(sum);
+            }
+
+            preactivations.push(z);
+            activations.push(y.clone());
+            current = y;
+        }
+
+        let last = network.layers.len() - 1;
+        if activations[last + 1].len() != target.len() {
+            return None;
+        }
+
+        let output_width = target.len().max(1) as f32;
+        let mut delta = vec![0.0; network.layers[last].output];
+
+        for output in 0..delta.len() {
+            let error = activations[last + 1][output] - target[output];
+            delta[output] = 2.0 * error / output_width
+                * network.layers[last]
+                    .activation
+                    .derivative(preactivations[last][output]);
+        }
+
+        for layer_index in (0..network.layers.len()).rev() {
+            let layer = &network.layers[layer_index];
+            let previous_activation = &activations[layer_index];
+
+            for output in 0..layer.output {
+                let gradient = delta[output];
+                bias_saliency[layer_index][output] +=
+                    (layer.bias[output] * gradient).abs();
+
+                for (input_index, previous_value) in
+                    previous_activation.iter().enumerate().take(layer.input)
+                {
+                    let index = layer.index(output, input_index);
+                    if layer.active[index] {
+                        let gradient_weight =
+                            gradient * *previous_value;
+                        weight_saliency[layer_index][index] +=
+                            (layer.weights[index] * gradient_weight).abs();
+                    }
+                }
+            }
+
+            if layer_index > 0 {
+                let mut previous_delta =
+                    vec![0.0; network.layers[layer_index - 1].output];
+
+                for input_index in 0..layer.input {
+                    let mut sum = 0.0;
+
+                    for (output, gradient) in
+                        delta.iter().enumerate().take(layer.output)
+                    {
+                        let index = layer.index(output, input_index);
+                        if layer.active[index] {
+                            sum += layer.weights[index] * *gradient;
+                        }
+                    }
+
+                    previous_delta[input_index] = sum
+                        * network.layers[layer_index - 1]
+                            .activation
+                            .derivative(
+                                preactivations[layer_index - 1][input_index],
+                            );
+                }
+
+                delta = previous_delta;
+            }
+        }
+    }
+
+    let scale = sample_indices.len() as f32;
+
+    for weights in &mut weight_saliency {
+        for value in weights {
+            *value /= scale;
+        }
+    }
+
+    for biases in &mut bias_saliency {
+        for value in biases {
+            *value /= scale;
+        }
+    }
+
+    Some(ParameterSaliency {
+        weights: weight_saliency,
+        biases: bias_saliency,
     })
 }
 
@@ -717,12 +982,12 @@ fn neuron_ablation_delta(
     baseline_mse: f32,
     layer: usize,
     neuron: usize,
-    samples: usize,
+    sample_indices: &[usize],
 ) -> f32 {
     let mut candidate = network.clone();
     prune_neuron(&mut candidate, layer, neuron);
 
-    behavior_mse(&candidate, dataset, samples) - baseline_mse
+    behavior_mse(&candidate, dataset, sample_indices) - baseline_mse
 }
 
 fn edge_ablation_delta(
@@ -732,12 +997,12 @@ fn edge_ablation_delta(
     layer: usize,
     output: usize,
     input: usize,
-    samples: usize,
+    sample_indices: &[usize],
 ) -> f32 {
     let mut candidate = network.clone();
     prune_connection(&mut candidate, layer, output, input);
 
-    behavior_mse(&candidate, dataset, samples) - baseline_mse
+    behavior_mse(&candidate, dataset, sample_indices) - baseline_mse
 }
 
 fn behavior_prunable_neuron(
@@ -756,8 +1021,28 @@ fn behavior_prunable_neuron(
         for neuron in 0..network.layers[layer].output {
             let trace = &profile.layers[layer];
 
-            let proxy = trace.mean_abs[neuron]
-                + trace.variance[neuron].sqrt();
+            let incoming_saliency = trace
+                .weight_saliency
+                .iter()
+                .skip(neuron * network.layers[layer].input)
+                .take(network.layers[layer].input)
+                .copied()
+                .sum::<f32>();
+            let outgoing_saliency = if layer + 1 < network.layers.len() {
+                let next = &profile.layers[layer + 1];
+                (0..network.layers[layer + 1].output)
+                    .map(|output| {
+                        next.weight_saliency[
+                            network.layers[layer + 1].index(output, neuron)
+                        ]
+                    })
+                    .sum::<f32>()
+            } else {
+                0.0
+            };
+            let proxy = trace.bias_saliency[neuron]
+                + incoming_saliency
+                + outgoing_saliency;
 
             scored.push((layer, neuron, proxy));
         }
@@ -779,7 +1064,7 @@ fn behavior_prunable_neuron(
             profile.baseline_mse,
             layer,
             neuron,
-            config.behavior_samples,
+            &profile.indices,
         );
 
         let score = (
@@ -813,8 +1098,18 @@ fn behavior_split_neuron(
         let trace = &profile.layers[layer];
 
         for neuron in 0..network.layers[layer].output {
-            let score =
-                trace.variance[neuron] * (1.0 + trace.mean_abs[neuron]);
+            let saliency = trace
+                .weight_saliency
+                .iter()
+                .skip(neuron * network.layers[layer].input)
+                .take(network.layers[layer].input)
+                .copied()
+                .sum::<f32>()
+                + trace.bias_saliency[neuron];
+
+            let score = trace.variance[neuron]
+                * (1.0 + trace.mean_abs[neuron])
+                * (1.0 + saliency);
 
             if best.is_none_or(|candidate: (usize, usize, f32)| {
                 score > candidate.2
@@ -881,12 +1176,19 @@ fn behavior_merge_pair(
         pairs.into_iter().take(limit)
     {
         let mut candidate = network.clone();
-        merge_neurons(&mut candidate, layer, first, second);
+        merge_neurons_with_trace(
+            &mut candidate,
+            layer,
+            first,
+            second,
+            &profile.layers[layer],
+            &profile.inputs,
+        );
 
         let delta = behavior_mse(
             &candidate,
             dataset,
-            config.behavior_samples,
+            &profile.indices,
         ) - profile.baseline_mse;
 
         if delta <= config.behavior_merge_tolerance
@@ -932,25 +1234,26 @@ fn behavior_prunable_connection(
                     continue;
                 }
 
-                let weight = current.weights[current.index(output, input)];
+                let index = current.index(output, input);
+                let saliency =
+                    profile.layers[layer].weight_saliency[index];
+
                 let input_activity = if layer == 0 {
-                    dataset.inputs
+                    profile
+                        .inputs
                         .iter()
-                        .take(config.behavior_samples)
                         .map(|sample| sample[input].abs())
                         .sum::<f32>()
-                        / dataset.inputs.len().min(config.behavior_samples).max(1)
-                            as f32
+                        / profile.inputs.len().max(1) as f32
                 } else {
-                    profile.layers[layer - 1]
-                        .mean_abs[input]
+                    profile.layers[layer - 1].mean_abs[input]
                 };
 
                 edges.push((
                     layer,
                     output,
                     input,
-                    weight.abs() * input_activity,
+                    saliency + 1e-6 * input_activity,
                 ));
             }
         }
@@ -974,7 +1277,7 @@ fn behavior_prunable_connection(
             layer,
             output,
             input,
-            config.behavior_samples,
+            &profile.indices,
         );
 
         if best.is_none_or(|current: (usize, usize, usize, f32)| {
@@ -1022,7 +1325,7 @@ fn behavior_rewire(
             let delta = behavior_mse(
                 &candidate,
                 dataset,
-                config.behavior_samples,
+                &profile.indices,
             ) - profile.baseline_mse;
 
             if best_target
@@ -1049,10 +1352,17 @@ pub fn apply_guided_mutation<R: Rng>(
     dataset: &Dataset,
     rng: &mut R,
 ) -> Option<MutationKind> {
+    let mut sample_indices =
+        (0..dataset.inputs.len()).collect::<Vec<_>>();
+    sample_indices.shuffle(rng);
+    sample_indices.truncate(
+        config.behavior_samples.min(sample_indices.len()),
+    );
+
     let profile = behavior_profile(
         network,
         dataset,
-        config.behavior_samples,
+        &sample_indices,
     )?;
 
     let prune_neuron =
@@ -1147,7 +1457,19 @@ pub fn apply_guided_mutation<R: Rng>(
         _ => return None,
     };
 
-    apply_mutation(network, &mutation, rng);
+    match &mutation {
+        MutationKind::MergeNeurons { layer, first, second } => {
+            merge_neurons_with_trace(
+                network,
+                *layer,
+                *first,
+                *second,
+                &profile.layers[*layer],
+                &profile.inputs,
+            );
+        }
+        _ => apply_mutation(network, &mutation, rng),
+    }
 
     Some(mutation)
 }
