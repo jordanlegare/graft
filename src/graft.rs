@@ -964,12 +964,12 @@ fn neuron_ablation_delta(
     baseline_mse: f32,
     layer: usize,
     neuron: usize,
-    samples: usize,
+    sample_indices: &[usize],
 ) -> f32 {
     let mut candidate = network.clone();
     prune_neuron(&mut candidate, layer, neuron);
 
-    behavior_mse(&candidate, dataset, samples) - baseline_mse
+    behavior_mse(&candidate, dataset, sample_indices) - baseline_mse
 }
 
 fn edge_ablation_delta(
@@ -979,12 +979,12 @@ fn edge_ablation_delta(
     layer: usize,
     output: usize,
     input: usize,
-    samples: usize,
+    sample_indices: &[usize],
 ) -> f32 {
     let mut candidate = network.clone();
     prune_connection(&mut candidate, layer, output, input);
 
-    behavior_mse(&candidate, dataset, samples) - baseline_mse
+    behavior_mse(&candidate, dataset, sample_indices) - baseline_mse
 }
 
 fn behavior_prunable_neuron(
@@ -1003,8 +1003,28 @@ fn behavior_prunable_neuron(
         for neuron in 0..network.layers[layer].output {
             let trace = &profile.layers[layer];
 
-            let proxy = trace.mean_abs[neuron]
-                + trace.variance[neuron].sqrt();
+            let incoming_saliency = trace
+                .weight_saliency
+                .iter()
+                .skip(neuron * network.layers[layer].input)
+                .take(network.layers[layer].input)
+                .copied()
+                .sum::<f32>();
+            let outgoing_saliency = if layer + 1 < network.layers.len() {
+                let next = &profile.layers[layer + 1];
+                (0..network.layers[layer + 1].output)
+                    .map(|output| {
+                        next.weight_saliency[
+                            network.layers[layer + 1].index(output, neuron)
+                        ]
+                    })
+                    .sum::<f32>()
+            } else {
+                0.0
+            };
+            let proxy = trace.bias_saliency[neuron]
+                + incoming_saliency
+                + outgoing_saliency;
 
             scored.push((layer, neuron, proxy));
         }
@@ -1026,7 +1046,7 @@ fn behavior_prunable_neuron(
             profile.baseline_mse,
             layer,
             neuron,
-            config.behavior_samples,
+            &profile.indices,
         );
 
         let score = (
@@ -1128,12 +1148,19 @@ fn behavior_merge_pair(
         pairs.into_iter().take(limit)
     {
         let mut candidate = network.clone();
-        merge_neurons(&mut candidate, layer, first, second);
+        merge_neurons_with_trace(
+            &mut candidate,
+            layer,
+            first,
+            second,
+            &profile.layers[layer],
+            &profile.inputs,
+        );
 
         let delta = behavior_mse(
             &candidate,
             dataset,
-            config.behavior_samples,
+            &profile.indices,
         ) - profile.baseline_mse;
 
         if delta <= config.behavior_merge_tolerance
@@ -1179,25 +1206,26 @@ fn behavior_prunable_connection(
                     continue;
                 }
 
-                let weight = current.weights[current.index(output, input)];
+                let index = current.index(output, input);
+                let saliency =
+                    profile.layers[layer].weight_saliency[index];
+
                 let input_activity = if layer == 0 {
-                    dataset.inputs
+                    profile
+                        .inputs
                         .iter()
-                        .take(config.behavior_samples)
                         .map(|sample| sample[input].abs())
                         .sum::<f32>()
-                        / dataset.inputs.len().min(config.behavior_samples).max(1)
-                            as f32
+                        / profile.inputs.len().max(1) as f32
                 } else {
-                    profile.layers[layer - 1]
-                        .mean_abs[input]
+                    profile.layers[layer - 1].mean_abs[input]
                 };
 
                 edges.push((
                     layer,
                     output,
                     input,
-                    weight.abs() * input_activity,
+                    saliency + 1e-6 * input_activity,
                 ));
             }
         }
@@ -1221,7 +1249,7 @@ fn behavior_prunable_connection(
             layer,
             output,
             input,
-            config.behavior_samples,
+            &profile.indices,
         );
 
         if best.is_none_or(|current: (usize, usize, usize, f32)| {
