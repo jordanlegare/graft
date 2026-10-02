@@ -1,5 +1,9 @@
-use crate::model::Activation;
-use rand::Rng;
+use crate::{
+    energy::{HardwareProfile, WorkloadCost},
+    model::Activation,
+    statistics,
+};
+use rand::{Rng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -277,6 +281,149 @@ impl GraphNetwork {
             .iter()
             .map(GraphNode::parameter_count)
             .sum()
+    }
+
+    pub fn workload_cost(&self, batch_size: usize) -> WorkloadCost {
+        let shapes = match self.infer_shapes() {
+            Ok(shapes) => shapes,
+            Err(_) => return WorkloadCost::default(),
+        };
+
+        let batch = batch_size as u64;
+        let mut cost = WorkloadCost::default();
+
+        for node in &self.nodes {
+            let shape = shapes.get(&node.id).copied();
+            let output_size = shape.map(TensorShape::size).unwrap_or(0) as u64;
+
+            match &node.op {
+                GraphOp::Input { .. } => {}
+                GraphOp::Dense { .. } => {
+                    cost.macs = cost.macs.saturating_add(
+                        batch.saturating_mul(node.weights.len() as u64),
+                    );
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(
+                            node.weights.len() as u64
+                                + node.bias.len() as u64,
+                        ),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.activation_ops = cost.activation_ops.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+                GraphOp::Conv1d {
+                    input_channels,
+                    output_channels,
+                    kernel,
+                    stride,
+                } => {
+                    let Some(input) = node.inputs.first()
+                        .and_then(|id| shapes.get(id))
+                    else {
+                        continue;
+                    };
+                    let output_length =
+                        valid_conv_output_length(input.length, *kernel, *stride);
+                    let macs = output_length
+                        * output_channels
+                        * input_channels
+                        * kernel;
+
+                    cost.macs = cost.macs.saturating_add(
+                        batch.saturating_mul(macs as u64),
+                    );
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(
+                            node.weights.len() as u64
+                                + node.bias.len() as u64,
+                        ),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+                GraphOp::SelfAttention { channels, .. } => {
+                    let Some(input) = node.inputs.first()
+                        .and_then(|id| shapes.get(id))
+                    else {
+                        continue;
+                    };
+                    let sequence = input.length as u64;
+                    let channels = *channels as u64;
+                    let macs = 4 * sequence * channels * channels
+                        + 2 * sequence * sequence * channels;
+
+                    cost.macs = cost.macs.saturating_add(
+                        batch.saturating_mul(macs),
+                    );
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(
+                            node.weights.len() as u64
+                                + node.bias.len() as u64,
+                        ),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.activation_ops = cost.activation_ops.saturating_add(
+                        batch.saturating_mul(sequence * sequence),
+                    );
+                }
+                GraphOp::Recurrent { input_size, hidden_size } => {
+                    let Some(input) = node.inputs.first()
+                        .and_then(|id| shapes.get(id))
+                    else {
+                        continue;
+                    };
+                    let macs = input.length
+                        * hidden_size
+                        * (input_size + hidden_size);
+
+                    cost.macs = cost.macs.saturating_add(
+                        batch.saturating_mul(macs as u64),
+                    );
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(
+                            node.weights.len() as u64
+                                + node.bias.len() as u64,
+                        ),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.activation_ops = cost.activation_ops.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+                GraphOp::Add => {
+                    let input_reads =
+                        node.inputs.len() as u64 * output_size;
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(input_reads),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+                GraphOp::Activation { .. } => {
+                    cost.memory_reads = cost.memory_reads.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.memory_writes = cost.memory_writes.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                    cost.activation_ops = cost.activation_ops.saturating_add(
+                        batch.saturating_mul(output_size),
+                    );
+                }
+            }
+        }
+
+        cost
     }
 
     pub fn mac_count(&self) -> u64 {
