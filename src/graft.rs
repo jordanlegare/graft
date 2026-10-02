@@ -2,7 +2,7 @@ use crate::{
     data::Dataset,
     model::{DenseLayer, Network},
 };
-use rand::Rng;
+use rand::{Rng, seq::SliceRandom};
 use std::fmt;
 
 #[derive(Debug, Clone)]
