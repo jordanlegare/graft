@@ -1080,8 +1080,18 @@ fn behavior_split_neuron(
         let trace = &profile.layers[layer];
 
         for neuron in 0..network.layers[layer].output {
-            let score =
-                trace.variance[neuron] * (1.0 + trace.mean_abs[neuron]);
+            let saliency = trace
+                .weight_saliency
+                .iter()
+                .skip(neuron * network.layers[layer].input)
+                .take(network.layers[layer].input)
+                .copied()
+                .sum::<f32>()
+                + trace.bias_saliency[neuron];
+
+            let score = trace.variance[neuron]
+                * (1.0 + trace.mean_abs[neuron])
+                * (1.0 + saliency);
 
             if best.is_none_or(|candidate: (usize, usize, f32)| {
                 score > candidate.2
