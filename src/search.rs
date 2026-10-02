@@ -526,6 +526,54 @@ mod tests {
     }
 
     #[test]
+    fn mlp_gradient_matches_finite_difference() {
+        let mut network = Network {
+            layers: vec![crate::model::DenseLayer {
+                input: 1,
+                output: 1,
+                weights: vec![0.2],
+                bias: vec![0.1],
+                activation: Activation::Linear,
+                active: vec![true],
+            }],
+        };
+
+        let input = [0.7f32];
+        let target = [0.4f32];
+        let epsilon = 1e-3f32;
+        let learning_rate = 1e-4f32;
+
+        let loss_with_weight = |weight: f32| {
+            let mut candidate = network.clone();
+            candidate.layers[0].weights[0] = weight;
+            let prediction =
+                candidate.forward(&input).expect("forward")[0];
+            let delta = prediction - target[0];
+            0.5 * delta * delta
+        };
+
+        let plus = loss_with_weight(network.layers[0].weights[0] + epsilon);
+        let minus = loss_with_weight(network.layers[0].weights[0] - epsilon);
+        let numerical = (plus - minus) / (2.0 * epsilon);
+        let before = network.layers[0].weights[0];
+
+        train(&mut network, &Dataset {
+            inputs: vec![input.to_vec()],
+            targets: vec![target.to_vec()],
+        }, 1, learning_rate);
+
+        let analytical =
+            (before - network.layers[0].weights[0]) / learning_rate;
+        let relative_error = (analytical - numerical).abs()
+            / (1.0 + analytical.abs() + numerical.abs());
+
+        assert!(
+            relative_error < 1e-4,
+            "analytical={analytical}, numerical={numerical}, relative_error={relative_error}"
+        );
+    }
+
+    #[test]
     fn budget_training_produces_at_least_one_epoch() {
         assert_eq!(train_epochs_for_budget(10, 100, 5, Some(1)), 1);
         assert_eq!(train_epochs_for_budget(10, 100, 5, Some(2_000)), 2);
