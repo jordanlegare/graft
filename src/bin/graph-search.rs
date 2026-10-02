@@ -212,10 +212,7 @@ fn main() -> Result<()> {
 
     let mut rows = Vec::with_capacity(results.len());
 
-    for (candidate, network) in &results {
-        let holdout_mse =
-            dataset_mse(network, &holdout)?;
-
+    for (candidate, _network) in &results {
         rows.push(ResultRow {
             id: candidate.id,
             validation_mse: candidate.mse,
