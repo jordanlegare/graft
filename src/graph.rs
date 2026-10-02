@@ -3275,6 +3275,83 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
+    fn scalar_training_loss(
+        graph: &GraphNetwork,
+        input: &[f32],
+        target: &[f32],
+    ) -> f32 {
+        let output = graph.forward(input).expect("forward");
+        output
+            .iter()
+            .zip(target)
+            .map(|(prediction, expected)| {
+                let delta = *prediction - *expected;
+                0.5 * delta * delta
+            })
+            .sum()
+    }
+
+    fn assert_weight_gradient(
+        graph: &GraphNetwork,
+        node_id: usize,
+        weight_index: usize,
+        input: &[f32],
+        target: &[f32],
+        label: &str,
+    ) {
+        let learning_rate = 1e-4f32;
+        let epsilon = 1e-3f32;
+        let before = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .expect("node")
+            .weights[weight_index];
+
+        let plus = {
+            let mut candidate = graph.clone();
+            let node = candidate
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                .expect("node");
+            node.weights[weight_index] += epsilon;
+            scalar_training_loss(&candidate, input, target)
+        };
+        let minus = {
+            let mut candidate = graph.clone();
+            let node = candidate
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                .expect("node");
+            node.weights[weight_index] -= epsilon;
+            scalar_training_loss(&candidate, input, target)
+        };
+
+        let numerical = (plus - minus) / (2.0 * epsilon);
+
+        let mut trained = graph.clone();
+        trained
+            .train(&[input.to_vec()], &[target.to_vec()], 1, learning_rate)
+            .expect("one step");
+        let after = trained
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .expect("node")
+            .weights[weight_index];
+
+        let analytical = (before - after) / learning_rate;
+        let relative_error = (analytical - numerical).abs()
+            / (1.0 + analytical.abs() + numerical.abs());
+
+        assert!(
+            relative_error < 2e-2,
+            "{label}: analytical={analytical}, numerical={numerical}, relative_error={relative_error}"
+        );
+    }
+
     #[test]
     fn convolution_forward_has_expected_shape() {
         let input_shape =
@@ -3328,6 +3405,54 @@ mod tests {
         assert_eq!(
             graph.forward(&[0.1; 10]).expect("forward").len(),
             2
+        );
+    }
+
+    #[test]
+    fn convolution_gradient_matches_finite_difference() {
+        let shape = TensorShape::sequence(1, 3).expect("shape");
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let conv = GraphNode {
+            id: 1,
+            inputs: vec![0],
+            op: GraphOp::Conv1d {
+                input_channels: 1,
+                output_channels: 1,
+                kernel: 2,
+                stride: 1,
+            },
+            weights: vec![0.2, -0.1],
+            bias: vec![0.05],
+        };
+        let dense = GraphNode {
+            id: 2,
+            inputs: vec![1],
+            op: GraphOp::Dense {
+                input: 2,
+                output: 1,
+            },
+            weights: vec![0.3, 0.4],
+            bias: vec![0.1],
+        };
+        let graph = GraphNetwork {
+            nodes: vec![input, conv, dense],
+            output: 2,
+        };
+
+        graph.validate().expect("graph");
+        assert_weight_gradient(
+            &graph,
+            1,
+            0,
+            &[0.6, -0.2, 0.4],
+            &[0.7],
+            "conv",
         );
     }
 
@@ -3444,6 +3569,61 @@ mod tests {
     }
 
     #[test]
+    fn attention_gradient_matches_finite_difference() {
+        let shape = TensorShape::sequence(2, 2).expect("shape");
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let attention = GraphNode {
+            id: 1,
+            inputs: vec![0],
+            op: GraphOp::SelfAttention {
+                channels: 2,
+                heads: 1,
+            },
+            weights: vec![
+                0.10, -0.05,
+                0.03, 0.08,
+                -0.02, 0.04,
+                0.07, -0.06,
+                0.05, 0.02,
+                -0.04, 0.09,
+                0.06, -0.03,
+                0.02, 0.05,
+            ],
+            bias: vec![0.01, -0.02],
+        };
+        let dense = GraphNode {
+            id: 2,
+            inputs: vec![1],
+            op: GraphOp::Dense {
+                input: 4,
+                output: 1,
+            },
+            weights: vec![0.2, -0.1, 0.15, 0.05],
+            bias: vec![0.03],
+        };
+        let graph = GraphNetwork {
+            nodes: vec![input, attention, dense],
+            output: 2,
+        };
+
+        graph.validate().expect("graph");
+        assert_weight_gradient(
+            &graph,
+            1,
+            0,
+            &[0.2, -0.4, 0.3, 0.5],
+            &[0.1],
+            "attention",
+        );
+    }
+
+    #[test]
     fn recurrent_forward_has_expected_shape() {
         let shape =
             TensorShape::sequence(3, 4).expect("shape");
@@ -3496,6 +3676,52 @@ mod tests {
     }
 
     #[test]
+    fn recurrent_gradient_matches_finite_difference() {
+        let shape = TensorShape::sequence(1, 3).expect("shape");
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let recurrent = GraphNode {
+            id: 1,
+            inputs: vec![0],
+            op: GraphOp::Recurrent {
+                input_size: 1,
+                hidden_size: 1,
+            },
+            weights: vec![0.25, 0.10],
+            bias: vec![0.02],
+        };
+        let dense = GraphNode {
+            id: 2,
+            inputs: vec![1],
+            op: GraphOp::Dense {
+                input: 3,
+                output: 1,
+            },
+            weights: vec![0.2, -0.15, 0.1],
+            bias: vec![0.05],
+        };
+        let graph = GraphNetwork {
+            nodes: vec![input, recurrent, dense],
+            output: 2,
+        };
+
+        graph.validate().expect("graph");
+        assert_weight_gradient(
+            &graph,
+            1,
+            1,
+            &[0.6, -0.3, 0.2],
+            &[0.4],
+            "recurrent",
+        );
+    }
+
+    #[test]
     fn residual_dag_forward_and_rewire_are_valid() {
         let shape =
             TensorShape::vector(4).expect("shape");
@@ -3513,6 +3739,69 @@ mod tests {
 
         assert_eq!(residual, 4);
         assert_eq!(graph.forward(&[0.1; 4]).expect("forward").len(), 2);
+    }
+
+    #[test]
+    fn residual_and_activation_gradient_matches_finite_difference() {
+        let shape = TensorShape::vector(1).expect("shape");
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let left = GraphNode {
+            id: 1,
+            inputs: vec![0],
+            op: GraphOp::Dense { input: 1, output: 1 },
+            weights: vec![0.2],
+            bias: vec![0.1],
+        };
+        let right = GraphNode {
+            id: 2,
+            inputs: vec![0],
+            op: GraphOp::Dense { input: 1, output: 1 },
+            weights: vec![-0.1],
+            bias: vec![0.05],
+        };
+        let add = GraphNode {
+            id: 3,
+            inputs: vec![1, 2],
+            op: GraphOp::Add,
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let activation = GraphNode {
+            id: 4,
+            inputs: vec![3],
+            op: GraphOp::Activation {
+                activation: Activation::Tanh,
+            },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let output = GraphNode {
+            id: 5,
+            inputs: vec![4],
+            op: GraphOp::Dense { input: 1, output: 1 },
+            weights: vec![0.4],
+            bias: vec![0.02],
+        };
+        let graph = GraphNetwork {
+            nodes: vec![input, left, right, add, activation, output],
+            output: 5,
+        };
+
+        graph.validate().expect("graph");
+        assert_weight_gradient(
+            &graph,
+            1,
+            0,
+            &[0.7],
+            &[0.25],
+            "residual/activation",
+        );
     }
 
     #[test]
