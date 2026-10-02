@@ -512,6 +512,8 @@ cargo run --release --bin neuro-search -- \
   --epochs 25 \
   --learning-rate 0.01 \
   --accuracy-tolerance 0.01 \
+  --relative-accuracy-tolerance 0.01 \
+  --bootstrap-samples 1000 \
   --min-width 4 \
   --max-width 64 \
   --min-depth 1 \
