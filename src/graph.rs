@@ -2808,6 +2808,7 @@ impl Default for GraphSearchConfig {
 pub struct GraphCandidate {
     pub id: usize,
     pub mse: f32,
+    pub accuracy_accepted: bool,
     pub parameters: usize,
     pub macs: u64,
     pub mutations: Vec<GraphMutation>,
@@ -2857,11 +2858,14 @@ pub fn search_graph<R: Rng>(
 
         let mse =
             graph_mse(&candidate, validation_inputs, validation_targets)?;
+        let accuracy_accepted =
+            mse <= baseline_mse + config.accuracy_tolerance;
 
         results.push((
             GraphCandidate {
                 id,
                 mse,
+                accuracy_accepted,
                 parameters: candidate.parameter_count(),
                 macs: candidate.mac_count(),
                 mutations,
@@ -2871,12 +2875,7 @@ pub fn search_graph<R: Rng>(
     }
 
     results.sort_by(|a, b| {
-        let a_accepted =
-            a.0.mse <= baseline_mse + config.accuracy_tolerance;
-        let b_accepted =
-            b.0.mse <= baseline_mse + config.accuracy_tolerance;
-
-        match (a_accepted, b_accepted) {
+        match (a.0.accuracy_accepted, b.0.accuracy_accepted) {
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
             _ => a

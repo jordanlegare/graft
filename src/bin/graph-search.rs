@@ -6,6 +6,7 @@ use graft::{
         graph_mse, search_graph, GraphNetwork, GraphSearchConfig,
     },
 };
+use rand::{rngs::StdRng, SeedableRng};
 use serde::Serialize;
 use std::fs;
 
@@ -45,6 +46,9 @@ struct Args {
     #[arg(long, default_value_t = 42)]
     split_seed: u64,
 
+    #[arg(long, default_value_t = 42)]
+    search_seed: u64,
+
     #[arg(long)]
     export_best: Option<String>,
 
@@ -57,6 +61,7 @@ struct ResultRow {
     id: usize,
     validation_mse: f32,
     holdout_mse: f32,
+    accuracy_accepted: bool,
     parameters: usize,
     macs: u64,
     mutations: Vec<String>,
@@ -117,7 +122,7 @@ fn main() -> Result<()> {
 
     let baseline_validation_mse =
         dataset_mse(&graph, &validation)?;
-    let mut rng = rand::rng();
+    let mut rng = StdRng::seed_from_u64(args.search_seed);
 
     let results = search_graph(
         &graph,
@@ -169,6 +174,7 @@ fn main() -> Result<()> {
             id: candidate.id,
             validation_mse: candidate.mse,
             holdout_mse,
+            accuracy_accepted: candidate.accuracy_accepted,
             parameters: candidate.parameters,
             macs: candidate.macs,
             mutations: candidate
@@ -180,13 +186,15 @@ fn main() -> Result<()> {
     }
 
     rows.sort_by(|a, b| {
-        a.macs
-            .cmp(&b.macs)
+        b.accuracy_accepted
+            .cmp(&a.accuracy_accepted)
+            .then_with(|| a.macs.cmp(&b.macs))
             .then_with(|| {
                 a.validation_mse
                     .partial_cmp(&b.validation_mse)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .then_with(|| a.id.cmp(&b.id))
     });
 
     fs::write(
