@@ -33,7 +33,7 @@ It can:
 - evaluate the selected candidate on a never-seen holdout set
 - export the sparse topology and parameters
 
-The mutation engine combines weight information with observed behavior such as activation magnitude, variance, sparsity, correlation, and validation-ablation loss.
+The mutation engine combines weight information with observed behavior such as activation magnitude, variance, sparsity, correlation, first-order Taylor saliency, and probe-set ablation loss.
 
 ### 2. General neural-graph search
 
@@ -435,25 +435,43 @@ That hypothesis is now testable in code.
 
 # Dataset separation and experimental integrity
 
-Graft uses a reproducible three-way split:
+Graft keeps architecture guidance separate from candidate selection on the MLP path.
 
-- **training samples** are used for candidate fine-tuning
-- **validation samples** drive mutation probes, acceptance, and candidate ranking
-- **holdout samples** are evaluated only after the search
+For **MLP search**, the default reproducible four-way split is:
 
-The default split is 70% training, 15% validation, and 15% holdout.
+- **60% training** — candidate fine-tuning
+- **10% probe** — behavior profiling, ablation tests, Taylor saliency, and guided mutation decisions
+- **15% validation** — paired statistical acceptance and candidate ranking
+- **15% holdout** — post-search evaluation of the selected candidate
 
 The split is controlled with:
 
 ~~~
+--probe-fraction
 --validation-fraction
 --holdout-fraction
 --split-seed
 ~~~
 
-This separation matters for energy research because a topology that saves compute but quietly loses task quality is not a valid optimization.
+The MLP search also reports a paired validation difference for each candidate:
 
----
+~~~
+delta_mean = mean(
+  per-sample MSE(candidate) - per-sample MSE(baseline)
+)
+~~~
+
+and a deterministic bootstrap 95% upper confidence bound (delta_ucb). Acceptance requires that the upper bound stay within the larger of the absolute and relative tolerances.
+
+For **general graph search**, the current CLI still uses a three-way split:
+
+- **70% training**
+- **15% validation**
+- **15% holdout**
+
+The graph path does not use a separate probe set yet; its mutations are structural, while validation remains reserved for candidate acceptance and ranking.
+
+This separation matters for energy research because a topology that saves compute but quietly loses task quality is not a valid optimization.
 
 # General graph search
 
@@ -470,6 +488,8 @@ cargo run --release --bin graph-search -- \
   --epochs 5 \
   --learning-rate 0.01 \
   --accuracy-tolerance 0.01 \
+  --relative-accuracy-tolerance 0.01 \
+  --bootstrap-samples 1000 \
   --validation-fraction 0.15 \
   --holdout-fraction 0.15 \
   --split-seed 42 \
@@ -500,6 +520,7 @@ cargo run --release --bin neuro-search -- \
   --guided-mutations 3 \
   --similarity-threshold 0.85 \
   --activation-candidates relu,tanh \
+  --probe-fraction 0.10 \
   --validation-fraction 0.15 \
   --holdout-fraction 0.15 \
   --split-seed 42 \
@@ -539,7 +560,7 @@ This makes the discovered sparse topology portable to a later sparse compiler/ru
 
 # Optional hardware energy model
 
-For the MLP path, an optional hardware profile can provide analytical energy coefficients:
+Both search paths accept the same optional hardware profile for an **analytical energy proxy**:
 
 ~~~json
 {
@@ -550,35 +571,64 @@ For the MLP path, an optional hardware profile can provide analytical energy coe
 }
 ~~~
 
-Run with:
+Run either search command with:
 
-~~~bash
+~~~
 --hardware hardware.json
 ~~~
 
-The model uses active connections when estimating MAC and weight-read energy.
+The shared cost model tracks:
 
-This is an **analytical estimate**, not a physical measurement. The final production claim must come from measurements on the actual accelerator, runtime, server, and data-center facility.
+- MACs
+- memory reads
+- memory writes
+- activation/nonlinear operation work
 
----
+For the **MLP path**, sparse active connections determine the MAC and weight-read counts.
+
+For the **graph path**, operator-specific structural costs cover dense, convolution, self-attention, recurrent, residual/add, and activation nodes. Attention includes a coarse additional operation term for the quadratic attention/softmax workload.
+
+These are analytical estimates, not physical measurements. Real savings depend on sparse-kernel support, accelerator utilization, memory behavior, compiler/runtime mapping, and the target workload.
 
 # Interpreting search results
 
-Search result mse is validation MSE.
+Search results report validation quality plus analytical workload cost.
 
-Each result also records holdout_mse; the holdout value is computed only after candidate generation and does not affect candidate selection.
+For MLP candidates, useful fields include:
+
+~~~
+validation MSE
+validation_delta_mean
+validation_delta_ucb
+acceptance_tolerance
+parameter count
+active connections
+MAC count
+estimated energy
+training epochs / training MACs
+Pareto-optimal flag
+holdout MSE
+~~~
+
+Acceptance is not based only on one aggregate MSE number. The paired per-sample loss differences are bootstrapped, and the candidate is accepted when the 95% upper confidence bound remains within the configured absolute/relative tolerance.
+
+The Pareto flag identifies accepted candidates that are not dominated by another accepted candidate on both validation MSE and analytical energy. It is a decision aid, not a claim of measured hardware superiority.
+
+Holdout evaluation is post-search and does not affect candidate selection. The MLP CLI records holdout MSE for the selected result; the graph CLI reports holdout MSE for its top result.
 
 A useful energy-oriented experiment should compare at least:
 
 ~~~
 quality:
-  validation MSE
-  holdout MSE
+  validation quality
+  holdout quality
 
 complexity:
   parameter count
   active connections
   MAC count
+  memory traffic
+  activation / attention work
 
 deployment:
   latency
@@ -590,8 +640,6 @@ deployment:
 ~~~
 
 A candidate is only an energy win in production when its quality and service requirements remain acceptable **and** the target implementation actually consumes less electricity.
-
----
 
 # Build
 
@@ -703,73 +751,83 @@ All per-query figures in this README are **reference measurements or scenario ca
 
 # Search validity model
 
-The search pipeline now separates **training**, **probe**, **validation**, and **holdout** data on the MLP path.
+The MLP search uses four distinct roles for the data:
 
-- **Training** data is used only for candidate fine-tuning.
-- **Probe** data drives behavior profiling, ablation tests, Taylor saliency, and guided mutation decisions.
-- **Validation** data is reserved for candidate acceptance and Pareto analysis.
-- **Holdout** data is evaluated only for the final selected candidate.
+1. **Training** — optimize candidate parameters.
+2. **Probe** — guide architecture mutations without touching the selection criterion.
+3. **Validation** — accept and rank candidates.
+4. **Holdout** — estimate post-search generalization only after selection.
 
-Candidate acceptance uses paired per-sample MSE differences rather than comparing two aggregate MSE values:
+This is important because repeatedly using the same validation data to choose mutations and then to declare a candidate successful can make the reported validation result optimistic.
 
-[
-d_i = operatorname{MSE}_i(mathrm{candidate}) -
-      operatorname{MSE}_i(mathrm{baseline})
-]
+## Paired statistical acceptance
 
-A deterministic bootstrap estimates the 95% upper confidence bound of the mean paired difference. A candidate is accepted when that upper bound is no larger than:
+For each validation sample i:
 
-[
-max(
-epsilon_{mathrm{absolute}},
-epsilon_{mathrm{relative}},
-mathrm{MSE}_{mathrm{baseline}}
+~~~
+d_i = MSE_i(candidate) - MSE_i(baseline)
+~~~
+
+The search reports:
+
+~~~
+delta_mean = mean(d_i)
+delta_ucb  = bootstrap 95% upper confidence bound of mean(d_i)
+~~~
+
+The acceptance tolerance is:
+
+~~~
+tolerance = max(
+  absolute_accuracy_tolerance,
+  relative_accuracy_tolerance × baseline_validation_MSE
 )
-]
+~~~
 
-This keeps the quality criterion scale-aware while accounting for paired sampling uncertainty.
+A candidate is accepted when:
+
+~~~
+delta_ucb <= tolerance
+~~~
+
+The pairing matters because candidate and baseline are evaluated on the same validation samples.
 
 ## Guided mutation mathematics
 
 Neuron and connection pruning use a first-order Taylor saliency proxy:
 
-[
-S_j approx |	heta_j 
-abla_{	heta_j} L|
-]
+~~~
+S_j ≈ |theta_j × dL/dtheta_j|
+~~~
 
-Saliency is aggregated over the parameter group affected by a mutation. This is combined with activation statistics and, where applicable, direct ablation measurements.
+Saliency is aggregated over the parameter group affected by a mutation and is combined with activation statistics and direct probe-set ablation tests.
 
-Neuron merging no longer simply averages incoming parameters and sums outgoing weights. The incoming representation is initialized from the two neurons, then each outgoing coefficient is locally refit by least squares on the probe activation trace:
+Neuron merging uses the probe activation trace rather than relying only on parameter averaging. After constructing a merged neuron, each outgoing coefficient is locally refit by least squares:
 
-[
-c^* =
-rac{sum_i h_i,y_i}
-     {sum_i h_i^2}
-]
+~~~
+c* = sum(h_i × y_i) / sum(h_i²)
+~~~
 
-where (h_i) is the merged-neuron activation and (y_i) is the contribution previously produced by the two outgoing edges.
+where h_i is the merged-neuron activation and y_i is the contribution previously produced by the two outgoing edges.
 
 ## Cost vector
 
-Both search engines expose the same analytical workload dimensions:
+Both search paths expose a shared analytical workload model:
 
 - MACs
 - memory reads
 - memory writes
-- activation / softmax operations
+- activation/nonlinear operation work
 
-The hardware profile maps those dimensions to an analytical energy estimate. This is still a deployment proxy: real savings depend on sparse-kernel support, accelerator utilization, memory behavior, and physical power measurement.
+The hardware profile maps those dimensions to an analytical energy estimate. It remains a deployment proxy: real electrical savings depend on sparse execution support, accelerator utilization, memory traffic, runtime/compiler mapping, and physical measurements.
 
 ## Training budget
 
-Search can optionally cap candidate fine-tuning by a common training-MAC budget with:
+Search can optionally cap candidate fine-tuning with:
 
-```text
+~~~
 --training-macs-budget <MACs>
-```
+~~~
 
-With this option, candidates receive enough epochs to consume approximately the requested optimizer-work budget, with at least one epoch.
-
-Without it, the configured epoch count is used.
+With this option, the number of training epochs is derived from the candidate's MAC count and training-set size, with a minimum of one epoch. Without it, the configured epoch count is used.
 
