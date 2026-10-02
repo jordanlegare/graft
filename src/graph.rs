@@ -3584,6 +3584,19 @@ mod tests {
     }
 
     #[test]
+    fn graph_workload_cost_includes_non_mac_operations() {
+        let shape = TensorShape::vector(2).expect("shape");
+        let mut rng = StdRng::seed_from_u64(29);
+        let graph = random_graph(shape, 2, &mut rng).expect("graph");
+        let cost = graph.workload_cost(1);
+
+        assert!(cost.macs > 0);
+        assert!(cost.memory_reads > 0);
+        assert!(cost.memory_writes > 0);
+        assert!(cost.activation_ops > 0);
+    }
+
+    #[test]
     fn random_graph_search_produces_candidates() {
         let shape =
             TensorShape::sequence(2, 3).expect("shape");
@@ -3605,6 +3618,7 @@ mod tests {
                 epochs: 1,
                 learning_rate: 0.001,
                 accuracy_tolerance: 0.1,
+                ..GraphSearchConfig::default()
             },
             &mut rng,
         )
