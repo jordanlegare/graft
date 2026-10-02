@@ -651,10 +651,14 @@ struct BehaviorTrace {
     mean_abs: Vec<f32>,
     variance: Vec<f32>,
     zero_fraction: Vec<f32>,
+    weight_saliency: Vec<f32>,
+    bias_saliency: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
 struct BehaviorProfile {
+    inputs: Vec<Vec<f32>>,
+    indices: Vec<usize>,
     layers: Vec<BehaviorTrace>,
     baseline_mse: f32,
 }
@@ -662,18 +666,16 @@ struct BehaviorProfile {
 fn behavior_mse(
     network: &Network,
     dataset: &Dataset,
-    max_samples: usize,
+    sample_indices: &[usize],
 ) -> f32 {
-    let sample_count = dataset.inputs.len().min(max_samples);
-
-    if sample_count == 0 {
+    if sample_indices.is_empty() {
         return f32::INFINITY;
     }
 
     let mut error = 0.0f64;
     let mut count = 0usize;
 
-    for index in 0..sample_count {
+    for index in sample_indices.iter().copied() {
         let Ok(output) = network.forward(&dataset.inputs[index]) else {
             return f32::INFINITY;
         };
@@ -701,9 +703,9 @@ fn behavior_mse(
 fn behavior_profile(
     network: &Network,
     dataset: &Dataset,
-    max_samples: usize,
+    sample_indices: &[usize],
 ) -> Option<BehaviorProfile> {
-    let sample_count = dataset.inputs.len().min(max_samples);
+    let sample_count = sample_indices.len();
 
     if sample_count == 0 || network.layers.is_empty() {
         return None;
@@ -717,10 +719,12 @@ fn behavior_profile(
             mean_abs: vec![0.0; layer.output],
             variance: vec![0.0; layer.output],
             zero_fraction: vec![0.0; layer.output],
+            weight_saliency: vec![0.0; layer.weights.len()],
+            bias_saliency: vec![0.0; layer.bias.len()],
         })
         .collect::<Vec<_>>();
 
-    for sample_index in 0..sample_count {
+    for sample_index in sample_indices.iter().copied() {
         let activations =
             network.forward_activations(&dataset.inputs[sample_index]).ok()?;
 
@@ -744,7 +748,6 @@ fn behavior_profile(
     for trace in &mut layers {
         for neuron in 0..trace.mean_abs.len() {
             trace.mean_abs[neuron] /= samples;
-
             trace.zero_fraction[neuron] /= samples;
 
             let mean = trace.samples
@@ -764,10 +767,158 @@ fn behavior_profile(
         }
     }
 
+    let (weight_saliency, bias_saliency) =
+        parameter_saliency(network, dataset, sample_indices)?;
+
+    for (layer, (weights, biases)) in
+        layers.iter_mut()
+            .zip(weight_saliency.into_iter().zip(bias_saliency))
+    {
+        layer.weight_saliency = weights;
+        layer.bias_saliency = biases;
+    }
+
     Some(BehaviorProfile {
+        inputs: sample_indices
+            .iter()
+            .map(|index| dataset.inputs[*index].clone())
+            .collect(),
+        indices: sample_indices.to_vec(),
         layers,
-        baseline_mse: behavior_mse(network, dataset, max_samples),
+        baseline_mse: behavior_mse(network, dataset, sample_indices),
     })
+}
+
+fn parameter_saliency(
+    network: &Network,
+    dataset: &Dataset,
+    sample_indices: &[usize],
+) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    if sample_indices.is_empty() || network.layers.is_empty() {
+        return None;
+    }
+
+    let mut weight_saliency = network
+        .layers
+        .iter()
+        .map(|layer| vec![0.0; layer.weights.len()])
+        .collect::<Vec<_>>();
+    let mut bias_saliency = network
+        .layers
+        .iter()
+        .map(|layer| vec![0.0; layer.bias.len()])
+        .collect::<Vec<_>>();
+
+    for sample_index in sample_indices.iter().copied() {
+        let input = &dataset.inputs[sample_index];
+        let target = &dataset.targets[sample_index];
+        let mut activations = Vec::with_capacity(network.layers.len() + 1);
+        let mut preactivations =
+            Vec::with_capacity(network.layers.len());
+        activations.push(input.clone());
+
+        let mut current = input.clone();
+        for layer in &network.layers {
+            let mut z = vec![0.0; layer.output];
+            let mut y = vec![0.0; layer.output];
+
+            for output in 0..layer.output {
+                let mut sum = layer.bias[output];
+
+                for input_index in 0..layer.input {
+                    let index = layer.index(output, input_index);
+                    if layer.active[index] {
+                        sum += layer.weights[index] * current[input_index];
+                    }
+                }
+
+                z[output] = sum;
+                y[output] = layer.activation.apply(sum);
+            }
+
+            preactivations.push(z);
+            activations.push(y.clone());
+            current = y;
+        }
+
+        let last = network.layers.len() - 1;
+        if activations[last + 1].len() != target.len() {
+            return None;
+        }
+
+        let output_width = target.len().max(1) as f32;
+        let mut delta = vec![0.0; network.layers[last].output];
+
+        for output in 0..delta.len() {
+            let error = activations[last + 1][output] - target[output];
+            delta[output] = 2.0 * error / output_width
+                * network.layers[last]
+                    .activation
+                    .derivative(preactivations[last][output]);
+        }
+
+        for layer_index in (0..network.layers.len()).rev() {
+            let layer = &network.layers[layer_index];
+            let previous_activation = &activations[layer_index];
+
+            for output in 0..layer.output {
+                let gradient = delta[output];
+                bias_saliency[layer_index][output] +=
+                    (layer.bias[output] * gradient).abs();
+
+                for input_index in 0..layer.input {
+                    let index = layer.index(output, input_index);
+                    if layer.active[index] {
+                        let gradient_weight =
+                            gradient * previous_activation[input_index];
+                        weight_saliency[layer_index][index] +=
+                            (layer.weights[index] * gradient_weight).abs();
+                    }
+                }
+            }
+
+            if layer_index > 0 {
+                let mut previous_delta =
+                    vec![0.0; network.layers[layer_index - 1].output];
+
+                for input_index in 0..layer.input {
+                    let mut sum = 0.0;
+
+                    for output in 0..layer.output {
+                        let index = layer.index(output, input_index);
+                        if layer.active[index] {
+                            sum += layer.weights[index] * delta[output];
+                        }
+                    }
+
+                    previous_delta[input_index] = sum
+                        * network.layers[layer_index - 1]
+                            .activation
+                            .derivative(
+                                preactivations[layer_index - 1][input_index],
+                            );
+                }
+
+                delta = previous_delta;
+            }
+        }
+    }
+
+    let scale = sample_indices.len() as f32;
+
+    for weights in &mut weight_saliency {
+        for value in weights {
+            *value /= scale;
+        }
+    }
+
+    for biases in &mut bias_saliency {
+        for value in biases {
+            *value /= scale;
+        }
+    }
+
+    Some((weight_saliency, bias_saliency))
 }
 
 fn activation_correlation(
