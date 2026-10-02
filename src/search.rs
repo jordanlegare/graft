@@ -6,7 +6,7 @@ use crate::{
     },
     model::{Activation, Network},
 };
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -21,6 +21,8 @@ pub struct SearchConfig {
     pub min_depth: usize,
     pub max_depth: usize,
     pub hidden_activations: Vec<Activation>,
+    // Seed controlling candidate generation and guided mutations.
+    pub seed: u64,
 
     // Fraction of candidates seeded from the supplied trained network.
     pub guided_fraction: f32,
@@ -244,7 +246,7 @@ pub fn search(
     baseline: &Network,
 ) -> Vec<SearchCandidate> {
     let baseline_error = mse(baseline, validation_dataset);
-    let mut rng = rand::rng();
+    let mut rng = StdRng::seed_from_u64(cfg.seed);
     let mut results = Vec::with_capacity(cfg.candidates);
 
     for id in 0..cfg.candidates {
