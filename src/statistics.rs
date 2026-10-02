@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn paired_test_combines_absolute_and_relative_tolerance() {
         let result = paired_test(
-            &[0.01, 0.02, 0.00],
+            &[-0.01, -0.02, 0.00],
             1.0,
             0.005,
             0.01,
