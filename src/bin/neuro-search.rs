@@ -88,6 +88,9 @@ struct Args {
     #[arg(long, default_value_t = 42)]
     split_seed: u64,
 
+    #[arg(long, default_value_t = 42)]
+    search_seed: u64,
+
     #[arg(long)]
     export_best_dir: Option<String>,
 
@@ -502,6 +505,7 @@ fn main() -> Result<()> {
         min_depth: args.min_depth,
         max_depth: args.max_depth,
         hidden_activations: activation_candidates,
+        seed: args.search_seed,
         guided_fraction: args.guided_fraction,
         guided_mutations: args.guided_mutations,
         guided_config: GuidedMutationConfig {
