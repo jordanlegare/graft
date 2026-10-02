@@ -5,8 +5,9 @@ use crate::{
         apply_guided_mutations, mutation_strings, GuidedMutationConfig,
     },
     model::{Activation, Network},
+    statistics,
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, Rng, SeedableRng, seq::SliceRandom};
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -15,18 +16,17 @@ pub struct SearchConfig {
     pub epochs: usize,
     pub learning_rate: f32,
     pub accuracy_tolerance: f32,
+    pub relative_accuracy_tolerance: f32,
+    pub bootstrap_samples: usize,
     pub batch_size: usize,
+    pub training_macs_budget: Option<u64>,
     pub min_width: usize,
     pub max_width: usize,
     pub min_depth: usize,
     pub max_depth: usize,
     pub hidden_activations: Vec<Activation>,
-    // Seed controlling candidate generation and guided mutations.
     pub seed: u64,
-
-    // Fraction of candidates seeded from the supplied trained network.
     pub guided_fraction: f32,
-    // Number of parameter-guided mutations applied to a guided candidate.
     pub guided_mutations: usize,
     pub guided_config: GuidedMutationConfig,
 }
@@ -44,7 +44,13 @@ pub struct CandidateResult {
     pub macs: u64,
     pub mse: f32,
     pub holdout_mse: Option<f32>,
+    pub validation_delta_mean: f32,
+    pub validation_delta_ucb: f32,
+    pub acceptance_tolerance: f32,
     pub energy_pj: f64,
+    pub training_epochs: usize,
+    pub training_macs: u64,
+    pub pareto_optimal: bool,
     pub accuracy_accepted: bool,
 }
 
@@ -54,31 +60,36 @@ pub struct SearchCandidate {
     pub network: Network,
 }
 
+pub fn sample_mse_losses(network: &Network, dataset: &Dataset) -> Vec<f32> {
+    dataset
+        .inputs
+        .iter()
+        .zip(&dataset.targets)
+        .map(|(input, target)| {
+            let Ok(output) = network.forward(input) else {
+                return f32::INFINITY;
+            };
+
+            if output.len() != target.len() || output.is_empty() {
+                return f32::INFINITY;
+            }
+
+            let total = output
+                .iter()
+                .zip(target)
+                .map(|(prediction, expected)| {
+                    let delta = *prediction as f64 - *expected as f64;
+                    delta * delta
+                })
+                .sum::<f64>();
+
+            (total / output.len() as f64) as f32
+        })
+        .collect()
+}
+
 pub fn mse(network: &Network, dataset: &Dataset) -> f32 {
-    let mut error = 0.0f64;
-    let mut count = 0usize;
-
-    for (input, target) in dataset.inputs.iter().zip(&dataset.targets) {
-        let Ok(output) = network.forward(input) else {
-            return f32::INFINITY;
-        };
-
-        if output.len() != target.len() {
-            return f32::INFINITY;
-        }
-
-        for (prediction, expected) in output.iter().zip(target) {
-            let delta = *prediction as f64 - *expected as f64;
-            error += delta * delta;
-            count += 1;
-        }
-    }
-
-    if count == 0 {
-        f32::INFINITY
-    } else {
-        (error / count as f64) as f32
-    }
+    statistics::mean(&sample_mse_losses(network, dataset))
 }
 
 pub fn generate_topology(
@@ -105,10 +116,59 @@ pub fn train(
     epochs: usize,
     learning_rate: f32,
 ) {
+    if dataset.inputs.is_empty() {
+        return;
+    }
+
     for _ in 0..epochs {
         for (input, target) in dataset.inputs.iter().zip(&dataset.targets) {
             train_sample(network, input, target, learning_rate);
         }
+    }
+}
+
+pub fn train_shuffled(
+    network: &mut Network,
+    dataset: &Dataset,
+    epochs: usize,
+    learning_rate: f32,
+    seed: u64,
+) {
+    if dataset.inputs.is_empty() {
+        return;
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut order = (0..dataset.inputs.len()).collect::<Vec<_>>();
+
+    for _ in 0..epochs {
+        order.shuffle(&mut rng);
+
+        for index in &order {
+            train_sample(
+                network,
+                &dataset.inputs[*index],
+                &dataset.targets[*index],
+                learning_rate,
+            );
+        }
+    }
+}
+
+fn train_epochs_for_budget(
+    sample_count: usize,
+    macs: u64,
+    configured_epochs: usize,
+    training_macs_budget: Option<u64>,
+) -> usize {
+    match training_macs_budget {
+        Some(budget) if budget > 0 => {
+            let per_epoch = (macs.max(1) as u128)
+                .saturating_mul(sample_count.max(1) as u128);
+            let epochs = (budget as u128) / per_epoch;
+            epochs.clamp(1, usize::MAX as u128) as usize
+        }
+        _ => configured_epochs,
     }
 }
 
@@ -168,11 +228,10 @@ fn train_sample(
         let output = activations[last + 1][j];
         let error = output - target[j];
 
-        delta[j] =
-            error
-                * network.layers[last]
-                    .activation
-                    .derivative(preactivations[last][j]);
+        delta[j] = error
+            * network.layers[last]
+                .activation
+                .derivative(preactivations[last][j]);
     }
 
     for layer_idx in (0..network.layers.len()).rev() {
@@ -238,25 +297,56 @@ fn train_sample(
     }
 }
 
+fn pareto_flags(results: &mut [SearchCandidate]) {
+    for i in 0..results.len() {
+        let mut pareto = true;
+
+        if results[i].result.accuracy_accepted {
+            for j in 0..results.len() {
+                if i == j || !results[j].result.accuracy_accepted {
+                    continue;
+                }
+
+                let i_energy = results[i].result.energy_pj;
+                let j_energy = results[j].result.energy_pj;
+                let i_mse = results[i].result.mse;
+                let j_mse = results[j].result.mse;
+
+                if j_energy <= i_energy
+                    && j_mse <= i_mse
+                    && (j_energy < i_energy || j_mse < i_mse)
+                {
+                    pareto = false;
+                    break;
+                }
+            }
+        } else {
+            pareto = false;
+        }
+
+        results[i].result.pareto_optimal = pareto;
+    }
+}
+
 pub fn search(
     train_dataset: &Dataset,
+    probe_dataset: &Dataset,
     validation_dataset: &Dataset,
     cfg: &SearchConfig,
     hardware: &HardwareProfile,
     baseline: &Network,
 ) -> Vec<SearchCandidate> {
-    let baseline_error = mse(baseline, validation_dataset);
+    let baseline_losses = sample_mse_losses(baseline, validation_dataset);
+    let baseline_error = statistics::mean(&baseline_losses);
     let mut rng = StdRng::seed_from_u64(cfg.seed);
     let mut results = Vec::with_capacity(cfg.candidates);
 
     for id in 0..cfg.candidates {
-        let use_guided =
-            rng.random::<f32>() < cfg.guided_fraction;
+        let use_guided = rng.random::<f32>() < cfg.guided_fraction;
 
         let (mut candidate, origin, activation_name, mutation_history) =
             if use_guided {
                 let mut candidate = baseline.clone();
-
                 let mutation_count = if cfg.guided_mutations == 0 {
                     0
                 } else {
@@ -266,7 +356,7 @@ pub fn search(
                 let history = apply_guided_mutations(
                     &mut candidate,
                     &cfg.guided_config,
-                    validation_dataset,
+                    probe_dataset,
                     mutation_count,
                     &mut rng,
                 );
@@ -280,25 +370,18 @@ pub fn search(
             } else {
                 let topology = generate_topology(
                     baseline.layers[0].input,
-                    baseline.layers.last()
-                        .expect("non-empty baseline")
-                        .output,
+                    baseline.layers.last().expect("non-empty baseline").output,
                     cfg,
                     &mut rng,
                 );
-
                 let activation =
-                    cfg.hidden_activations[
-                        rng.random_range(0..cfg.hidden_activations.len())
-                    ];
-
-                let candidate =
-                    crate::model::random_network(
-                        &topology,
-                        activation,
-                        &mut rng,
-                    )
-                    .expect("generated topology must be valid");
+                    cfg.hidden_activations[rng.random_range(0..cfg.hidden_activations.len())];
+                let candidate = crate::model::random_network(
+                    &topology,
+                    activation,
+                    &mut rng,
+                )
+                .expect("generated topology must be valid");
 
                 (
                     candidate,
@@ -308,39 +391,78 @@ pub fn search(
                 )
             };
 
-        train(
+        let candidate_macs = candidate.mac_count();
+        let training_epochs = train_epochs_for_budget(
+            train_dataset.inputs.len(),
+            candidate_macs,
+            cfg.epochs,
+            cfg.training_macs_budget,
+        );
+        train_shuffled(
             &mut candidate,
             train_dataset,
-            cfg.epochs,
+            training_epochs,
             cfg.learning_rate,
+            cfg.seed ^ ((id as u64).wrapping_mul(0x9E3779B97F4A7C15)),
         );
 
-        let candidate_mse = mse(&candidate, validation_dataset);
-        let energy =
-            estimate_energy(&candidate, hardware, cfg.batch_size);
+        let candidate_losses =
+            sample_mse_losses(&candidate, validation_dataset);
+        let candidate_mse = statistics::mean(&candidate_losses);
+        let differences = candidate_losses
+            .iter()
+            .zip(&baseline_losses)
+            .map(|(candidate_loss, baseline_loss)| {
+                *candidate_loss - *baseline_loss
+            })
+            .collect::<Vec<_>>();
 
-        let result = CandidateResult {
-            id,
-            origin: origin.to_owned(),
-            topology: candidate.topology(),
-            hidden_activation: activation_name,
-            mutations: mutation_history,
-            parameters: candidate.parameter_count(),
-            dense_parameters: candidate.dense_parameter_count(),
-            active_connections: candidate.active_connection_count(),
-            macs: candidate.mac_count(),
-            mse: candidate_mse,
-            holdout_mse: None,
-            energy_pj: energy,
-            accuracy_accepted:
-                candidate_mse <= baseline_error + cfg.accuracy_tolerance,
-        };
+        let paired = statistics::paired_test(
+            &differences,
+            baseline_error,
+            cfg.accuracy_tolerance,
+            cfg.relative_accuracy_tolerance,
+            cfg.bootstrap_samples,
+            cfg.seed ^ ((id as u64).wrapping_mul(0xD1B54A32D192ED03)),
+        );
+
+        let energy = estimate_energy(
+            &candidate,
+            hardware,
+            cfg.batch_size,
+        );
+        let training_macs =
+            candidate_macs.saturating_mul(
+                training_epochs as u64,
+            ).saturating_mul(train_dataset.inputs.len() as u64);
 
         results.push(SearchCandidate {
-            result,
+            result: CandidateResult {
+                id,
+                origin: origin.to_owned(),
+                topology: candidate.topology(),
+                hidden_activation: activation_name,
+                mutations: mutation_history,
+                parameters: candidate.parameter_count(),
+                dense_parameters: candidate.dense_parameter_count(),
+                active_connections: candidate.active_connection_count(),
+                macs: candidate_macs,
+                mse: candidate_mse,
+                holdout_mse: None,
+                validation_delta_mean: paired.mean_difference,
+                validation_delta_ucb: paired.upper_confidence_bound,
+                acceptance_tolerance: paired.tolerance,
+                energy_pj: energy,
+                training_epochs,
+                training_macs,
+                pareto_optimal: false,
+                accuracy_accepted: paired.accepted,
+            },
             network: candidate,
         });
     }
+
+    pareto_flags(&mut results);
 
     results.sort_by(|a, b| {
         match (
@@ -351,22 +473,62 @@ pub fn search(
             (false, true) => std::cmp::Ordering::Greater,
             _ => a
                 .result
-                .energy_pj
-                .partial_cmp(&b.result.energy_pj)
-                .unwrap_or(std::cmp::Ordering::Equal),
+                .pareto_optimal
+                .cmp(&b.result.pareto_optimal)
+                .reverse()
+                .then_with(|| {
+                    a.result.energy_pj
+                        .partial_cmp(&b.result.energy_pj)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    a.result.mse
+                        .partial_cmp(&b.result.mse)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.result.id.cmp(&b.result.id)),
         }
     });
 
     results
 }
 
-
 pub fn evaluate_holdout(
     results: &mut [SearchCandidate],
     holdout_dataset: &Dataset,
 ) {
-    for candidate in results {
-        candidate.result.holdout_mse =
-            Some(mse(&candidate.network, holdout_dataset));
+    for (index, candidate) in results.iter_mut().enumerate() {
+        candidate.result.holdout_mse = if index == 0 {
+            Some(mse(&candidate.network, holdout_dataset))
+        } else {
+            None
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Activation;
+
+    #[test]
+    fn sample_mse_losses_returns_one_loss_per_sample() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let network =
+            crate::model::random_network(&[1, 1], Activation::Linear, &mut rng)
+                .expect("network");
+        let dataset = Dataset {
+            inputs: vec![vec![1.0], vec![2.0]],
+            targets: vec![vec![0.0], vec![0.0]],
+        };
+
+        assert_eq!(sample_mse_losses(&network, &dataset).len(), 2);
+    }
+
+    #[test]
+    fn budget_training_produces_at_least_one_epoch() {
+        assert_eq!(train_epochs_for_budget(10, 100, 5, Some(1)), 1);
+        assert_eq!(train_epochs_for_budget(10, 100, 5, Some(2_000)), 2);
+        assert_eq!(train_epochs_for_budget(10, 100, 5, None), 5);
     }
 }
