@@ -3025,15 +3025,32 @@ mod tests {
         )
         .expect("conv");
 
+        let dense = GraphNode::with_random_parameters(
+            2,
+            vec![1],
+            GraphOp::Dense {
+                input: 6,
+                output: 2,
+            },
+            Some(TensorShape::sequence(3, 2).expect("conv shape")),
+            &mut rng,
+        )
+        .expect("dense");
+
         let graph = GraphNetwork {
-            nodes: vec![input, conv],
-            output: 1,
+            nodes: vec![input, conv, dense],
+            output: 2,
         };
         graph.validate().expect("valid graph");
 
-        assert_eq!(graph.output_shape().expect("shape").length, 2);
-        assert_eq!(graph.mac_count(), 36);
-        assert_eq!(graph.forward(&[0.1; 12]).expect("forward").len(), 6);
+        assert_eq!(
+            graph.nodes[1].id,
+            1,
+            "conv node must remain the sequence-producing node"
+        );
+        assert_eq!(graph.nodes[2].parameter_count(), 14);
+        assert_eq!(graph.mac_count(), 48);
+        assert_eq!(graph.forward(&[0.1; 12]).expect("forward").len(), 2);
     }
 
     #[test]
