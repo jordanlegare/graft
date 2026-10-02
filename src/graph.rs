@@ -284,8 +284,6 @@ impl GraphNetwork {
             Ok(shapes) => shapes,
             Err(_) => return 0,
         };
-        let by_id = self.node_map();
-
         self.nodes
             .iter()
             .map(|node| match &node.op {
@@ -303,8 +301,7 @@ impl GraphNetwork {
                         return 0;
                     };
                     let output_length =
-                        (shape.length.saturating_sub(*kernel) + *stride)
-                            .div_ceil(*stride);
+                        valid_conv_output_length(shape.length, *kernel, *stride);
                     (output_length
                         * output_channels
                         * input_channels
@@ -338,10 +335,7 @@ impl GraphNetwork {
                         * (input_size + hidden_size)) as u64
                 }
                 GraphOp::Add => 0,
-                GraphOp::Activation { .. } => by_id
-                    .get(&node.id)
-                    .and_then(|_| shapes.get(&node.id))
-                    .map_or(0, |shape| shape.size() as u64),
+                GraphOp::Activation { .. } => 0,
                 GraphOp::Input { .. } => 0,
             })
             .sum()
@@ -1293,7 +1287,7 @@ fn backward_node(
 
             let length = input.len() / *input_channels;
             let output_length =
-                (length - *kernel + *stride).div_ceil(*stride);
+                valid_conv_output_length(length, *kernel, *stride);
             let mut gradient_input =
                 vec![0.0; input.len()];
 
@@ -2523,7 +2517,7 @@ fn infer_node_shape(
                 "conv kernel exceeds sequence length"
             );
             let length =
-                (input.length - *kernel + *stride).div_ceil(*stride);
+                valid_conv_output_length(input.length, *kernel, *stride);
             TensorShape::sequence(*output_channels, length)
         }
         GraphOp::SelfAttention { channels, .. } => {
@@ -2572,7 +2566,7 @@ fn conv1d(
 ) -> anyhow::Result<Vec<f32>> {
     let length = x.len() / input_channels;
     let output_length =
-        (length - kernel + stride).div_ceil(stride);
+        valid_conv_output_length(length, kernel, stride);
 
     anyhow::ensure!(
         weights.len() == output_channels * input_channels * kernel,
@@ -2832,7 +2826,13 @@ pub fn search_graph<R: Rng>(
         "validation input/target counts differ"
     );
     anyhow::ensure!(config.candidates > 0, "graph candidate count must be > 0");
+    anyhow::ensure!(config.mutations > 0, "graph mutation count must be > 0");
     anyhow::ensure!(config.epochs > 0, "graph training epochs must be > 0");
+    anyhow::ensure!(
+        config.accuracy_tolerance.is_finite()
+            && config.accuracy_tolerance >= 0.0,
+        "graph accuracy_tolerance must be finite and >= 0"
+    );
     anyhow::ensure!(
         config.learning_rate > 0.0
             && config.learning_rate.is_finite(),
@@ -2891,6 +2891,11 @@ pub fn search_graph<R: Rng>(
     });
 
     Ok(results)
+}
+
+fn valid_conv_output_length(length: usize, kernel: usize, stride: usize) -> usize {
+    // Valid 1-D convolution: floor((L - K) / S) + 1.
+    (length - kernel) / stride + 1
 }
 
 pub fn graph_mse(
@@ -2986,6 +2991,66 @@ mod tests {
             graph.forward(&[0.1; 10]).expect("forward").len(),
             2
         );
+    }
+
+    #[test]
+    fn convolution_uses_valid_output_length_for_stride() {
+        assert_eq!(valid_conv_output_length(6, 3, 2), 2);
+        assert_eq!(valid_conv_output_length(7, 3, 2), 3);
+    }
+
+    #[test]
+    fn convolution_mac_count_matches_forward_shape() {
+        let shape = TensorShape::sequence(2, 6).expect("shape");
+        let mut rng = StdRng::seed_from_u64(31);
+
+        let input = GraphNode {
+            id: 0,
+            inputs: Vec::new(),
+            op: GraphOp::Input { shape },
+            weights: Vec::new(),
+            bias: Vec::new(),
+        };
+        let conv = GraphNode::with_random_parameters(
+            1,
+            vec![0],
+            GraphOp::Conv1d {
+                input_channels: 2,
+                output_channels: 3,
+                kernel: 3,
+                stride: 2,
+            },
+            Some(shape),
+            &mut rng,
+        )
+        .expect("conv");
+
+        let dense = GraphNode::with_random_parameters(
+            2,
+            vec![1],
+            GraphOp::Dense {
+                input: 6,
+                output: 2,
+            },
+            Some(TensorShape::sequence(3, 2).expect("conv shape")),
+            &mut rng,
+        )
+        .expect("dense");
+
+        let graph = GraphNetwork {
+            nodes: vec![input, conv, dense],
+            output: 2,
+        };
+        graph.validate().expect("valid graph");
+
+        assert_eq!(
+            graph.nodes[1].id,
+            1,
+            "conv node must remain the sequence-producing node"
+        );
+        assert_eq!(graph.nodes[2].parameter_count(), 14);
+        assert_eq!(graph.mac_count(), 48);
+        assert_eq!(graph.forward(&[0.1; 12]).expect("forward").len(), 2);
     }
 
     #[test]
