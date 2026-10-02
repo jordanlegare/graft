@@ -376,6 +376,19 @@ fn export_candidate(
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    anyhow::ensure!(
+        args.epochs > 0,
+        "epochs must be greater than zero"
+    );
+    anyhow::ensure!(
+        args.learning_rate > 0.0 && args.learning_rate.is_finite(),
+        "learning_rate must be finite and greater than zero"
+    );
+    anyhow::ensure!(
+        args.accuracy_tolerance >= 0.0
+            && args.accuracy_tolerance.is_finite(),
+        "accuracy_tolerance must be finite and non-negative"
+    );
     anyhow::ensure!(args.candidates > 0, "candidates must be greater than zero");
     anyhow::ensure!(args.batch_size > 0, "batch_size must be greater than zero");
     anyhow::ensure!(args.min_width <= args.max_width, "min_width > max_width");
