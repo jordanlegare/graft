@@ -284,8 +284,6 @@ impl GraphNetwork {
             Ok(shapes) => shapes,
             Err(_) => return 0,
         };
-        let by_id = self.node_map();
-
         self.nodes
             .iter()
             .map(|node| match &node.op {
