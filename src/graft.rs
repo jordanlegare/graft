@@ -1118,7 +1118,7 @@ fn behavior_rewire(
             let delta = behavior_mse(
                 &candidate,
                 dataset,
-                config.behavior_samples,
+                &profile.indices,
             ) - profile.baseline_mse;
 
             if best_target
@@ -1145,10 +1145,17 @@ pub fn apply_guided_mutation<R: Rng>(
     dataset: &Dataset,
     rng: &mut R,
 ) -> Option<MutationKind> {
+    let mut sample_indices =
+        (0..dataset.inputs.len()).collect::<Vec<_>>();
+    sample_indices.shuffle(rng);
+    sample_indices.truncate(
+        config.behavior_samples.min(sample_indices.len()),
+    );
+
     let profile = behavior_profile(
         network,
         dataset,
-        config.behavior_samples,
+        &sample_indices,
     )?;
 
     let prune_neuron =
