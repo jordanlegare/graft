@@ -2970,6 +2970,11 @@ pub struct GraphSearchConfig {
     pub epochs: usize,
     pub learning_rate: f32,
     pub accuracy_tolerance: f32,
+    pub relative_accuracy_tolerance: f32,
+    pub bootstrap_samples: usize,
+    pub batch_size: usize,
+    pub training_macs_budget: Option<u64>,
+    pub hardware: HardwareProfile,
 }
 
 impl Default for GraphSearchConfig {
@@ -2980,6 +2985,11 @@ impl Default for GraphSearchConfig {
             epochs: 5,
             learning_rate: 0.01,
             accuracy_tolerance: 0.01,
+            relative_accuracy_tolerance: 0.01,
+            bootstrap_samples: 1000,
+            batch_size: 1,
+            training_macs_budget: None,
+            hardware: HardwareProfile::default(),
         }
     }
 }
@@ -2988,10 +2998,107 @@ impl Default for GraphSearchConfig {
 pub struct GraphCandidate {
     pub id: usize,
     pub mse: f32,
+    pub validation_delta_mean: f32,
+    pub validation_delta_ucb: f32,
+    pub acceptance_tolerance: f32,
     pub accuracy_accepted: bool,
     pub parameters: usize,
     pub macs: u64,
+    pub memory_reads: u64,
+    pub memory_writes: u64,
+    pub activation_ops: u64,
+    pub energy_pj: f64,
+    pub training_epochs: usize,
+    pub training_macs: u64,
+    pub pareto_optimal: bool,
     pub mutations: Vec<GraphMutation>,
+}
+
+fn training_epochs_for_budget(
+    sample_count: usize,
+    macs: u64,
+    configured_epochs: usize,
+    training_macs_budget: Option<u64>,
+) -> usize {
+    match training_macs_budget {
+        Some(budget) if budget > 0 => {
+            let per_epoch = (macs.max(1) as u128)
+                .saturating_mul(sample_count.max(1) as u128);
+            ((budget as u128) / per_epoch)
+                .clamp(1, usize::MAX as u128) as usize
+        }
+        _ => configured_epochs,
+    }
+}
+
+pub fn sample_mse_losses(
+    network: &GraphNetwork,
+    inputs: &[Vec<f32>],
+    targets: &[Vec<f32>],
+) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(
+        inputs.len() == targets.len(),
+        "graph input/target counts differ"
+    );
+    anyhow::ensure!(!inputs.is_empty(), "graph evaluation dataset is empty");
+
+    let mut losses = Vec::with_capacity(inputs.len());
+
+    for (input, target) in inputs.iter().zip(targets) {
+        let output = network.forward(input)?;
+
+        anyhow::ensure!(
+            output.len() == target.len(),
+            "graph output width {} != target width {}",
+            output.len(),
+            target.len()
+        );
+
+        let loss = output
+            .iter()
+            .zip(target)
+            .map(|(prediction, expected)| {
+                let delta = *prediction as f64 - *expected as f64;
+                delta * delta
+            })
+            .sum::<f64>()
+            / output.len().max(1) as f64;
+
+        losses.push(loss as f32);
+    }
+
+    Ok(losses)
+}
+
+fn pareto_flags(
+    results: &mut [(GraphCandidate, GraphNetwork)],
+) {
+    for i in 0..results.len() {
+        let mut pareto = results[i].0.accuracy_accepted;
+
+        if pareto {
+            for j in 0..results.len() {
+                if i == j || !results[j].0.accuracy_accepted {
+                    continue;
+                }
+
+                let i_energy = results[i].0.energy_pj;
+                let j_energy = results[j].0.energy_pj;
+                let i_mse = results[i].0.mse;
+                let j_mse = results[j].0.mse;
+
+                if j_energy <= i_energy
+                    && j_mse <= i_mse
+                    && (j_energy < i_energy || j_mse < i_mse)
+                {
+                    pareto = false;
+                    break;
+                }
+            }
+        }
+
+        results[i].0.pareto_optimal = pareto;
+    }
 }
 
 pub fn search_graph<R: Rng>(
@@ -3011,54 +3118,123 @@ pub fn search_graph<R: Rng>(
         validation_inputs.len() == validation_targets.len(),
         "validation input/target counts differ"
     );
-    anyhow::ensure!(config.candidates > 0, "graph candidate count must be > 0");
-    anyhow::ensure!(config.mutations > 0, "graph mutation count must be > 0");
-    anyhow::ensure!(config.epochs > 0, "graph training epochs must be > 0");
+    anyhow::ensure!(!train_inputs.is_empty(), "graph training dataset is empty");
+    anyhow::ensure!(
+        config.candidates > 0,
+        "graph candidate count must be > 0"
+    );
+    anyhow::ensure!(
+        config.mutations > 0,
+        "graph mutation count must be > 0"
+    );
+    anyhow::ensure!(
+        config.epochs > 0,
+        "graph training epochs must be > 0"
+    );
     anyhow::ensure!(
         config.accuracy_tolerance.is_finite()
             && config.accuracy_tolerance >= 0.0,
         "graph accuracy_tolerance must be finite and >= 0"
     );
     anyhow::ensure!(
+        config.relative_accuracy_tolerance.is_finite()
+            && config.relative_accuracy_tolerance >= 0.0,
+        "graph relative_accuracy_tolerance must be finite and >= 0"
+    );
+    anyhow::ensure!(
+        config.bootstrap_samples > 0,
+        "graph bootstrap_samples must be > 0"
+    );
+    anyhow::ensure!(
+        config.batch_size > 0,
+        "graph batch_size must be > 0"
+    );
+    anyhow::ensure!(
         config.learning_rate > 0.0
             && config.learning_rate.is_finite(),
         "graph learning_rate must be finite and > 0"
     );
+    config.hardware.validate()?;
 
-    let baseline_mse =
-        graph_mse(baseline, validation_inputs, validation_targets)?;
-
+    let baseline_losses =
+        sample_mse_losses(baseline, validation_inputs, validation_targets)?;
+    let baseline_mse = statistics::mean(&baseline_losses);
     let mut results = Vec::with_capacity(config.candidates);
 
     for id in 0..config.candidates {
         let mut candidate = baseline.clone();
-        let mutations =
-            candidate.mutate(rng, config.mutations);
+        let mutations = candidate.mutate(rng, config.mutations);
 
-        candidate.train(
+        let candidate_macs = candidate.mac_count();
+        let training_epochs = training_epochs_for_budget(
+            train_inputs.len(),
+            candidate_macs,
+            config.epochs,
+            config.training_macs_budget,
+        );
+
+        candidate.train_shuffled(
             train_inputs,
             train_targets,
-            config.epochs,
+            training_epochs,
             config.learning_rate,
+            id as u64 ^ 0x9E3779B97F4A7C15,
         )?;
 
-        let mse =
-            graph_mse(&candidate, validation_inputs, validation_targets)?;
-        let accuracy_accepted =
-            mse <= baseline_mse + config.accuracy_tolerance;
+        let losses =
+            sample_mse_losses(&candidate, validation_inputs, validation_targets)?;
+        let mse = statistics::mean(&losses);
+        let differences = losses
+            .iter()
+            .zip(&baseline_losses)
+            .map(|(candidate_loss, baseline_loss)| {
+                *candidate_loss - *baseline_loss
+            })
+            .collect::<Vec<_>>();
+
+        let paired = statistics::paired_test(
+            &differences,
+            baseline_mse,
+            config.accuracy_tolerance,
+            config.relative_accuracy_tolerance,
+            config.bootstrap_samples,
+            id as u64 ^ 0xD1B54A32D192ED03,
+        );
+
+        let cost = candidate.workload_cost(config.batch_size);
+        let energy =
+            crate::energy::estimate_energy_from_cost(
+                cost,
+                &config.hardware,
+            );
+        let training_macs = candidate_macs
+            .saturating_mul(training_epochs as u64)
+            .saturating_mul(train_inputs.len() as u64);
 
         results.push((
             GraphCandidate {
                 id,
                 mse,
-                accuracy_accepted,
+                validation_delta_mean: paired.mean_difference,
+                validation_delta_ucb: paired.upper_confidence_bound,
+                acceptance_tolerance: paired.tolerance,
+                accuracy_accepted: paired.accepted,
                 parameters: candidate.parameter_count(),
-                macs: candidate.mac_count(),
+                macs: candidate_macs,
+                memory_reads: cost.memory_reads,
+                memory_writes: cost.memory_writes,
+                activation_ops: cost.activation_ops,
+                energy_pj: energy,
+                training_epochs,
+                training_macs,
+                pareto_optimal: false,
                 mutations,
             },
             candidate,
         ));
     }
+
+    pareto_flags(&mut results);
 
     results.sort_by(|a, b| {
         match (a.0.accuracy_accepted, b.0.accuracy_accepted) {
@@ -3066,13 +3242,12 @@ pub fn search_graph<R: Rng>(
             (false, true) => Ordering::Greater,
             _ => a
                 .0
-                .macs
-                .cmp(&b.0.macs)
-                .then_with(|| {
-                    a.0.mse
-                        .partial_cmp(&b.0.mse)
-                        .unwrap_or(Ordering::Equal)
-                }),
+                .pareto_optimal
+                .cmp(&b.0.pareto_optimal)
+                .reverse()
+                .then_with(|| a.0.energy_pj.total_cmp(&b.0.energy_pj))
+                .then_with(|| a.0.mse.total_cmp(&b.0.mse))
+                .then_with(|| a.0.id.cmp(&b.0.id)),
         }
     });
 
@@ -3089,32 +3264,9 @@ pub fn graph_mse(
     inputs: &[Vec<f32>],
     targets: &[Vec<f32>],
 ) -> anyhow::Result<f32> {
-    let mut error = 0.0f64;
-    let mut count = 0usize;
-
-    for (input, target) in inputs.iter().zip(targets) {
-        let output = network.forward(input)?;
-
-        anyhow::ensure!(
-            output.len() == target.len(),
-            "graph output width {} != target width {}",
-            output.len(),
-            target.len()
-        );
-
-        for (prediction, expected) in
-            output.iter().zip(target)
-        {
-            let delta =
-                *prediction as f64 - *expected as f64;
-            error += delta * delta;
-            count += 1;
-        }
-    }
-
-    anyhow::ensure!(count > 0, "validation dataset is empty");
-
-    Ok((error / count as f64) as f32)
+    Ok(statistics::mean(
+        &sample_mse_losses(network, inputs, targets)?,
+    ))
 }
 
 #[cfg(test)]
