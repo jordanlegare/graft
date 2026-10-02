@@ -392,6 +392,102 @@ fn merge_neurons(
     remove_column(next, second);
 }
 
+fn merge_neurons_with_trace(
+    network: &mut Network,
+    layer_idx: usize,
+    first: usize,
+    second: usize,
+    trace: &BehaviorTrace,
+    _inputs: &[Vec<f32>],
+) {
+    let layer = &network.layers[layer_idx];
+    let input_width = layer.input;
+
+    let mut merged_weights = Vec::with_capacity(input_width);
+    let mut merged_active = Vec::with_capacity(input_width);
+
+    for input in 0..input_width {
+        let first_idx = layer.index(first, input);
+        let second_idx = layer.index(second, input);
+        let first_active = layer.active[first_idx];
+        let second_active = layer.active[second_idx];
+
+        let value = match (first_active, second_active) {
+            (true, true) => {
+                (layer.weights[first_idx] + layer.weights[second_idx]) * 0.5
+            }
+            (true, false) => layer.weights[first_idx],
+            (false, true) => layer.weights[second_idx],
+            (false, false) => 0.0,
+        };
+
+        merged_weights.push(value);
+        merged_active.push(first_active || second_active);
+    }
+
+    let merged_bias = (layer.bias[first] + layer.bias[second]) * 0.5;
+
+    {
+        let layer = &mut network.layers[layer_idx];
+        let start = first * layer.input;
+        let end = start + layer.input;
+        layer.weights[start..end].copy_from_slice(&merged_weights);
+        layer.active[start..end].copy_from_slice(&merged_active);
+        layer.bias[first] = merged_bias;
+    }
+
+    // Fit each outgoing coefficient by least squares on the probe activation
+    // trace: c = argmin_c ||h_m c - (h_a w_a + h_b w_b)||^2.
+    // This is a local optimality step for the linear next-layer readout.
+    if layer_idx + 1 < network.layers.len() && !trace.samples.is_empty() {
+        let next = &mut network.layers[layer_idx + 1];
+
+        for output in 0..next.output {
+            let first_idx = next.index(output, first);
+            let second_idx = next.index(output, second);
+
+            let first_weight = if next.active[first_idx] {
+                next.weights[first_idx]
+            } else {
+                0.0
+            };
+            let second_weight = if next.active[second_idx] {
+                next.weights[second_idx]
+            } else {
+                0.0
+            };
+
+            let mut numerator = 0.0f64;
+            let mut denominator = 0.0f64;
+
+            for sample in &trace.samples {
+                let merged_activation =
+                    0.5 * (sample[first] + sample[second]);
+                let target =
+                    first_weight * sample[first]
+                        + second_weight * sample[second];
+
+                numerator +=
+                    merged_activation as f64 * target as f64;
+                denominator +=
+                    merged_activation as f64 * merged_activation as f64;
+            }
+
+            let coefficient = if denominator > 1e-12 {
+                (numerator / denominator) as f32
+            } else {
+                0.0
+            };
+
+            next.weights[first_idx] = coefficient;
+            next.active[first_idx] = coefficient.abs() > 1e-12;
+        }
+    }
+
+    remove_row(&mut network.layers[layer_idx], second);
+    remove_column(&mut network.layers[layer_idx + 1], second);
+}
+
 fn split_neuron<R: Rng>(
     network: &mut Network,
     layer_idx: usize,
