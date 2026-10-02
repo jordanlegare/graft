@@ -697,3 +697,79 @@ The README's energy examples are anchored to the following public sources and sh
   https://hai.stanford.edu/assets/files/ai_index_report_2026.pdf
 
 All per-query figures in this README are **reference measurements or scenario calculations**, not measurements produced by Graft itself.
+
+
+---
+
+# Search validity model
+
+The search pipeline now separates **training**, **probe**, **validation**, and **holdout** data on the MLP path.
+
+- **Training** data is used only for candidate fine-tuning.
+- **Probe** data drives behavior profiling, ablation tests, Taylor saliency, and guided mutation decisions.
+- **Validation** data is reserved for candidate acceptance and Pareto analysis.
+- **Holdout** data is evaluated only for the final selected candidate.
+
+Candidate acceptance uses paired per-sample MSE differences rather than comparing two aggregate MSE values:
+
+[
+d_i = operatorname{MSE}_i(mathrm{candidate}) -
+      operatorname{MSE}_i(mathrm{baseline})
+]
+
+A deterministic bootstrap estimates the 95% upper confidence bound of the mean paired difference. A candidate is accepted when that upper bound is no larger than:
+
+[
+max(
+epsilon_{mathrm{absolute}},
+epsilon_{mathrm{relative}},
+mathrm{MSE}_{mathrm{baseline}}
+)
+]
+
+This keeps the quality criterion scale-aware while accounting for paired sampling uncertainty.
+
+## Guided mutation mathematics
+
+Neuron and connection pruning use a first-order Taylor saliency proxy:
+
+[
+S_j approx |	heta_j 
+abla_{	heta_j} L|
+]
+
+Saliency is aggregated over the parameter group affected by a mutation. This is combined with activation statistics and, where applicable, direct ablation measurements.
+
+Neuron merging no longer simply averages incoming parameters and sums outgoing weights. The incoming representation is initialized from the two neurons, then each outgoing coefficient is locally refit by least squares on the probe activation trace:
+
+[
+c^* =
+rac{sum_i h_i,y_i}
+     {sum_i h_i^2}
+]
+
+where (h_i) is the merged-neuron activation and (y_i) is the contribution previously produced by the two outgoing edges.
+
+## Cost vector
+
+Both search engines expose the same analytical workload dimensions:
+
+- MACs
+- memory reads
+- memory writes
+- activation / softmax operations
+
+The hardware profile maps those dimensions to an analytical energy estimate. This is still a deployment proxy: real savings depend on sparse-kernel support, accelerator utilization, memory behavior, and physical power measurement.
+
+## Training budget
+
+Search can optionally cap candidate fine-tuning by a common training-MAC budget with:
+
+```text
+--training-macs-budget <MACs>
+```
+
+With this option, candidates receive enough epochs to consume approximately the requested optimizer-work budget, with at least one epoch.
+
+Without it, the configured epoch count is used.
+
