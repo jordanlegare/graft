@@ -3,7 +3,7 @@ use crate::{
     model::Activation,
     statistics,
 };
-use rand::{Rng, seq::SliceRandom};
+use rand::{Rng, SeedableRng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -645,6 +645,45 @@ impl GraphNetwork {
         for _ in 0..epochs {
             for (input, target) in inputs.iter().zip(targets) {
                 self.train_sample(input, target, learning_rate)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn train_shuffled(
+        &mut self,
+        inputs: &[Vec<f32>],
+        targets: &[Vec<f32>],
+        epochs: usize,
+        learning_rate: f32,
+        seed: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            inputs.len() == targets.len(),
+            "training input/target counts differ"
+        );
+        anyhow::ensure!(!inputs.is_empty(), "training dataset is empty");
+        anyhow::ensure!(epochs > 0, "training epochs must be > 0");
+        anyhow::ensure!(
+            learning_rate > 0.0 && learning_rate.is_finite(),
+            "learning_rate must be finite and > 0"
+        );
+
+        self.validate()?;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut order = (0..inputs.len()).collect::<Vec<_>>();
+
+        for _ in 0..epochs {
+            order.shuffle(&mut rng);
+
+            for index in &order {
+                self.train_sample(
+                    &inputs[*index],
+                    &targets[*index],
+                    learning_rate,
+                )?;
             }
         }
 
