@@ -656,6 +656,12 @@ struct BehaviorTrace {
 }
 
 #[derive(Debug, Clone)]
+struct ParameterSaliency {
+    weights: Vec<Vec<f32>>,
+    biases: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Clone)]
 struct BehaviorProfile {
     inputs: Vec<Vec<f32>>,
     indices: Vec<usize>,
@@ -767,12 +773,15 @@ fn behavior_profile(
         }
     }
 
-    let (weight_saliency, bias_saliency) =
+    let saliency =
         parameter_saliency(network, dataset, sample_indices)?;
 
     for (layer, (weights, biases)) in
         layers.iter_mut()
-            .zip(weight_saliency.into_iter().zip(bias_saliency))
+            .zip(
+                saliency.weights.into_iter()
+                    .zip(saliency.biases),
+            )
     {
         layer.weight_saliency = weights;
         layer.bias_saliency = biases;
@@ -793,7 +802,7 @@ fn parameter_saliency(
     network: &Network,
     dataset: &Dataset,
     sample_indices: &[usize],
-) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+) -> Option<ParameterSaliency> {
     if sample_indices.is_empty() || network.layers.is_empty() {
         return None;
     }
@@ -825,10 +834,12 @@ fn parameter_saliency(
             for output in 0..layer.output {
                 let mut sum = layer.bias[output];
 
-                for input_index in 0..layer.input {
+                for (input_index, current_value) in
+                    current.iter().enumerate().take(layer.input)
+                {
                     let index = layer.index(output, input_index);
                     if layer.active[index] {
-                        sum += layer.weights[index] * current[input_index];
+                        sum += layer.weights[index] * *current_value;
                     }
                 }
 
@@ -866,11 +877,13 @@ fn parameter_saliency(
                 bias_saliency[layer_index][output] +=
                     (layer.bias[output] * gradient).abs();
 
-                for input_index in 0..layer.input {
+                for (input_index, previous_value) in
+                    previous_activation.iter().enumerate().take(layer.input)
+                {
                     let index = layer.index(output, input_index);
                     if layer.active[index] {
                         let gradient_weight =
-                            gradient * previous_activation[input_index];
+                            gradient * *previous_value;
                         weight_saliency[layer_index][index] +=
                             (layer.weights[index] * gradient_weight).abs();
                     }
@@ -884,10 +897,12 @@ fn parameter_saliency(
                 for input_index in 0..layer.input {
                     let mut sum = 0.0;
 
-                    for output in 0..layer.output {
+                    for (output, gradient) in
+                        delta.iter().enumerate().take(layer.output)
+                    {
                         let index = layer.index(output, input_index);
                         if layer.active[index] {
-                            sum += layer.weights[index] * delta[output];
+                            sum += layer.weights[index] * *gradient;
                         }
                     }
 
@@ -918,7 +933,10 @@ fn parameter_saliency(
         }
     }
 
-    Some((weight_saliency, bias_saliency))
+    Some(ParameterSaliency {
+        weights: weight_saliency,
+        biases: bias_saliency,
+    })
 }
 
 fn activation_correlation(
