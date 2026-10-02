@@ -40,8 +40,17 @@ struct Args {
     #[arg(long, default_value_t = 0.01)]
     accuracy_tolerance: f32,
 
+    #[arg(long, default_value_t = 0.01)]
+    relative_accuracy_tolerance: f32,
+
+    #[arg(long, default_value_t = 1000)]
+    bootstrap_samples: usize,
+
     #[arg(long, default_value_t = 32)]
     batch_size: usize,
+
+    #[arg(long, default_value_t = 0)]
+    training_macs_budget: u64,
 
     #[arg(long, default_value_t = 4)]
     min_width: usize,
@@ -78,6 +87,9 @@ struct Args {
 
     #[arg(long, default_value_t = 0.01)]
     behavior_merge_tolerance: f32,
+
+    #[arg(long, default_value_t = 0.10)]
+    probe_fraction: f32,
 
     #[arg(long, default_value_t = 0.15)]
     validation_fraction: f32,
@@ -407,8 +419,24 @@ fn main() -> Result<()> {
         "holdout_fraction must be between 0 and 1"
     );
     anyhow::ensure!(
-        args.validation_fraction + args.holdout_fraction < 1.0,
-        "validation_fraction + holdout_fraction must be less than 1"
+        args.probe_fraction > 0.0 && args.probe_fraction < 1.0,
+        "probe_fraction must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        args.relative_accuracy_tolerance >= 0.0
+            && args.relative_accuracy_tolerance.is_finite(),
+        "relative_accuracy_tolerance must be finite and >= 0"
+    );
+    anyhow::ensure!(
+        args.bootstrap_samples > 0,
+        "bootstrap_samples must be > 0"
+    );
+    anyhow::ensure!(
+        args.probe_fraction
+            + args.validation_fraction
+            + args.holdout_fraction
+            < 1.0,
+        "probe_fraction + validation_fraction + holdout_fraction must be less than 1"
     );
     anyhow::ensure!(
         args.min_width >= 1,
@@ -425,8 +453,9 @@ fn main() -> Result<()> {
         serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
 
     let dataset = Dataset::load(&args.dataset)?;
-    let (train_dataset, validation_dataset, holdout_dataset) =
-        dataset.split_three_way(
+    let (train_dataset, probe_dataset, validation_dataset, holdout_dataset) =
+        dataset.split_four_way(
+            args.probe_fraction,
             args.validation_fraction,
             args.holdout_fraction,
             args.split_seed,
@@ -476,8 +505,9 @@ fn main() -> Result<()> {
         baseline.active_connection_count()
     );
     println!(
-        "  train/validation/holdout samples: {}/{}/{}",
+        "  train/probe/validation/holdout samples: {}/{}/{}/{}",
         train_dataset.inputs.len(),
+        probe_dataset.inputs.len(),
         validation_dataset.inputs.len(),
         holdout_dataset.inputs.len()
     );
@@ -499,7 +529,11 @@ fn main() -> Result<()> {
         epochs: args.epochs,
         learning_rate: args.learning_rate,
         accuracy_tolerance: args.accuracy_tolerance,
+        relative_accuracy_tolerance: args.relative_accuracy_tolerance,
+        bootstrap_samples: args.bootstrap_samples,
         batch_size: args.batch_size,
+        training_macs_budget: (args.training_macs_budget > 0)
+            .then_some(args.training_macs_budget),
         min_width: args.min_width,
         max_width: args.max_width,
         min_depth: args.min_depth,
@@ -523,6 +557,7 @@ fn main() -> Result<()> {
     let mut results =
         search(
             &train_dataset,
+            &probe_dataset,
             &validation_dataset,
             &config,
             &hardware,
@@ -538,16 +573,21 @@ fn main() -> Result<()> {
         let result = &candidate.result;
 
         println!(
-            "#{:03} origin={} topology={:?} active={} params={} validation_mse={:.6} holdout_mse={:.6} energy={:.3} pJ accepted={} mutations={:?}",
+            "#{:03} origin={} topology={:?} active={} params={} validation_mse={:.6} delta_mean={:.6} delta_ucb={:.6} tolerance={:.6} holdout_mse={:.6} energy={:.3} pJ pareto={} accepted={} train_epochs={} mutations={:?}",
             result.id,
             result.origin,
             result.topology,
             result.active_connections,
             result.parameters,
             result.mse,
+            result.validation_delta_mean,
+            result.validation_delta_ucb,
+            result.acceptance_tolerance,
             result.holdout_mse.unwrap_or(f32::NAN),
             result.energy_pj,
+            result.pareto_optimal,
             result.accuracy_accepted,
+            result.training_epochs,
             result.mutations
         );
     }
