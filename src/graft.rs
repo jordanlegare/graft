@@ -1439,7 +1439,19 @@ pub fn apply_guided_mutation<R: Rng>(
         _ => return None,
     };
 
-    apply_mutation(network, &mutation, rng);
+    match &mutation {
+        MutationKind::MergeNeurons { layer, first, second } => {
+            merge_neurons_with_trace(
+                network,
+                *layer,
+                *first,
+                *second,
+                &profile.layers[*layer],
+                &profile.inputs,
+            );
+        }
+        _ => apply_mutation(network, &mutation, rng),
+    }
 
     Some(mutation)
 }
