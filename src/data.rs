@@ -32,6 +32,23 @@ impl Dataset {
             "target rows have inconsistent widths"
         );
 
+        // Non-finite values propagate through forward passes and loss metrics.
+        // Reject them at the dataset boundary so a bad sample cannot silently
+        // invalidate training, candidate ranking, or statistical acceptance.
+        for (name, rows) in [
+            ("input", self.inputs.as_slice()),
+            ("target", self.targets.as_slice()),
+        ] {
+            for (sample_index, row) in rows.iter().enumerate() {
+                for (value_index, value) in row.iter().enumerate() {
+                    anyhow::ensure!(
+                        value.is_finite(),
+                        "{name} value at sample {sample_index}, index {value_index} must be finite"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -264,5 +281,37 @@ mod tests {
         let unique = values.iter().copied().collect::<HashSet<_>>();
         assert_eq!(values.len(), 20);
         assert_eq!(unique.len(), 20);
+    }
+
+    #[test]
+    fn validation_rejects_non_finite_inputs_and_targets() {
+        let invalid_datasets = [
+            Dataset {
+                inputs: vec![vec![f32::NAN]],
+                targets: vec![vec![0.0]],
+            },
+            Dataset {
+                inputs: vec![vec![f32::INFINITY]],
+                targets: vec![vec![0.0]],
+            },
+            Dataset {
+                inputs: vec![vec![0.0]],
+                targets: vec![vec![f32::NEG_INFINITY]],
+            },
+        ];
+
+        for dataset in invalid_datasets {
+            assert!(dataset.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn validation_accepts_finite_negative_and_zero_values() {
+        let dataset = Dataset {
+            inputs: vec![vec![-1.0, 0.0]],
+            targets: vec![vec![0.5, -0.25]],
+        };
+
+        assert!(dataset.validate().is_ok());
     }
 }
